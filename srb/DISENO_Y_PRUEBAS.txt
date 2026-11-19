@@ -327,11 +327,12 @@ Límites y advertencias:
 
 13. PRUEBAS test1 Y test2, MONITORES, CARGA SINTÉTICA Y CONTADOR EN VIVO  (v3.4)
 -----------------------------------------------------------------------------
-test1 (scripts/test1.sh): "una VM es suficiente". 3, 6 y 9 clientes a 600 solicitudes/min cada uno (T1_PASOS, T1_RPM). Veredicto
+test1 (scripts/test1.sh): "una VM es suficiente". 3, 6 y 9 clientes a 600 solicitudes/min cada uno, 10 s por paso (T1_PASOS, T1_RPM, T1_PASO_S). Veredicto
   automático (analisis/veredicto.py -> veredicto.md): siempre 1 nivel activo, CPU de la VM del GT bajo el umbral (50 %), VM4/VM5 sin
   trabajo, sin cubeta ni rechazos, sin errores y p95 < 1 s, y la VM sostiene >= 85 % del ritmo ofrecido.
-test2 (scripts/test2.sh): rampa PESADA hasta ocupar las 3 VMs. 2 -> 128 clientes sin pausa, 30 s por paso (T2_PASOS, T2_PASO_S) y
-  45 s de reposo. Veredicto: niveles 1 -> 2 -> 3 (y de vuelta a 1 en el reposo), las 3 VMs con CPU sostenida (3 s) >= 90 %, capacidad
+test2 (scripts/test2.sh): rampa PESADA hasta ocupar las 3 VMs. 2 -> 128 clientes sin pausa, 10 s por paso (T2_PASOS, T2_PASO_S) y
+  20 s de reposo (v3.5: 3 veces mas rapido que en v3.4: 30 s por paso y 45 s de reposo; el escalado usa T_SOSTENIDO_IN=5 y
+  T_ENFRIAR_S=5 en vez de 10 y 8). Veredicto: niveles 1 -> 2 -> 3 (y de vuelta a 1 en el reposo), las 3 VMs con CPU sostenida (3 s) >= 90 %, capacidad
   >= x1.5 al pasar de 1 a 3 niveles, leaky bucket activo, sin errores y p95 < 1 s. "Esencial" para aprobar: todo salvo la
   comparación de capacidad y que la cubeta llegue a rechazar (informativas; dependen de la BD y de CUBETA_T2).
 Carga sintética (bin/rmc --carga-cpu-ms N; CARGA_T=10 ms por defecto en test1/test2): cada solicitud consume N ms de CPU del hilo

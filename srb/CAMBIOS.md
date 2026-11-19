@@ -2,6 +2,15 @@
 
 La versión instalada en cada VM se ve con `cat VERSION`. Cada entrada dice **qué cambió** y **por qué**.
 
+## v3.5 (2026-11-18) – test1 y test2 tres veces más rápidos
+
+- **test1 ~1 min (antes ~2 min) y test2 ~3 min (antes ~7-8 min):** pasos de 10 s en vez de 30 s (`T1_PASO_S`, `T2_PASO_S`), reposo final
+  de 5 s / 20 s (`T1_REPOSO_S`, `T2_REPOSO_S`) y escalado más ágil en estas dos pruebas: el último nivel se libera tras 5 s con poca
+  CPU (`T_SOSTENIDO_IN`, antes 10 s) y el enfriamiento entre cambios es de 5 s (`T_ENFRIAR_S`, antes 8 s). El scale-out sigue pidiendo
+  3 s sostenidos. La corrida `escalamiento` conserva los tiempos de antes (`SOSTENIDO_OUT`, `SOSTENIDO_IN`, `ENFRIAR_S`).
+- `config.txt` guarda `sostenido_out_s`, `sostenido_in_s` y `enfriar_s`.
+- Para repetir la versión lenta: `T1_PASO_S=30 T2_PASO_S=30 T1_REPOSO_S=15 T2_REPOSO_S=45 T_SOSTENIDO_IN=10 T_ENFRIAR_S=8 scripts/test2.sh`.
+
 ## v3.4 (2026-11-18) – pruebas test1/test2, monitores y carga sintética
 
 **Nuevo**

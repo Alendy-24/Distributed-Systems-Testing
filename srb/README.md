@@ -96,8 +96,8 @@ scripts/monitor_bd.sh        # en VM2: peticiones en curso, transacciones/s, RAM
 **6. Correr las pruebas** (desde VM1; cada una arranca la topología, genera la carga, da el veredicto y deja la topología arriba):
 
 ```bash
-scripts/test1.sh | tee test1.txt         # UNA VM alcanza: carga ligera, VM3 sola, sin scale-out        (~2 min)
-scripts/test2.sh | tee test2.txt         # carga creciente hasta ocupar VM3+VM4+VM5 y el leaky bucket  (~7 min)
+scripts/test1.sh | tee test1.txt         # UNA VM alcanza: carga ligera, VM3 sola, sin scale-out        (~1 min)
+scripts/test2.sh | tee test2.txt         # carga creciente hasta ocupar VM3+VM4+VM5 y el leaky bucket  (~3 min)
 scripts/prueba_empirica.sh parar         # detiene todo en las 5 VMs
 ```
 
@@ -105,7 +105,7 @@ scripts/prueba_empirica.sh parar         # detiene todo en las 5 VMs
 están haciendo los clientes en ese instante:
 
 ```
->>> paso 3 de 11: 8 clientes durante 30s (solicitudes en vivo, una línea por segundo)
+>>> paso 3 de 11: 8 clientes durante 10s (solicitudes en vivo, una línea por segundo)
    21:34:41 EN VIVO t=  7s clientes=8 | enviadas=1530 respondidas=1522 ahora=218/s en_curso=8 | consulta=470 reserva=760 modif=292 | rechazadas=0 fallas=0
 ```
 
@@ -127,9 +127,13 @@ Para llevarse el PNG a su computador: `git add -f resultados_test2/escalamiento.
 | | test1 | test2 |
 |---|---|---|
 | Objetivo | Con poco tráfico **una VM alcanza**: no debe haber scale-out | Con tráfico creciente se **ocupan las 3 VMs** |
-| Carga | 3, 6 y 9 clientes a 600 solicitudes/min cada uno (30 s por paso) | 2, 4, 8, 12, 16, 24, 32, 48, 64, 96 y 128 clientes sin pausa (30 s por paso) + 45 s de reposo |
+| Carga | 3, 6 y 9 clientes a 600 solicitudes/min cada uno (10 s por paso) | 2, 4, 8, 12, 16, 24, 32, 48, 64, 96 y 128 clientes sin pausa (10 s por paso) + 20 s de reposo |
 | Debe verse | `niveles_activos = 1`, VM3 bajo 50 % de CPU, VM4/VM5 sin trabajo, sin cubeta, sin errores, p95 < 1 s | Orden 1 → 2 → 3 → 2 → 1, las 3 VMs al límite, más ops/s con más VMs, cubeta con rechazos `SOBRECARGA`, sin errores |
 | Veredicto | `APROBADO` / `REVISAR` en `veredicto.md` | igual |
+
+**Velocidad.** Desde v3.5 las dos pruebas son 3 veces más rápidas: pasos de 10 s (antes 30 s) y escalado más ágil (`T_SOSTENIDO_IN=5`,
+`T_ENFRIAR_S=5`; antes 10 s y 8 s). La versión lenta de antes:
+`T1_PASO_S=30 T2_PASO_S=30 T1_REPOSO_S=15 T2_REPOSO_S=45 T_SOSTENIDO_IN=10 T_ENFRIAR_S=8 scripts/test2.sh`.
 
 Ajustes: `T1_RPM`, `T1_PASOS`, `T1_PASO_S`; `T2_PASOS`, `T2_PASO_S`, `T2_REPOSO_S`, `CUBETA_T2`; `CARGA_T` (ms de CPU por solicitud) y
 `HILOS_T` (hilos de RMC por VM) para ambas. Ejemplo: `T1_RPM=300 scripts/test1.sh`.

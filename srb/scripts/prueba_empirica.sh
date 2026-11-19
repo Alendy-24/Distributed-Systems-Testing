@@ -34,8 +34,10 @@
 # Contador EN VIVO (solicitudes enviadas/respondidas/por segundo/en curso/rechazadas/fallas) en esta terminal mientras
 #   corre cada paso: EN_VIVO=1 (segundos entre líneas; 0 = apagado). Sale por stderr: con "| tee archivo" el archivo no
 #   lo guarda (use "2>&1 | tee" si lo quiere); la línea completa de cada paso queda siempre en el .gen.log de resultados.
-# test1 y test2 (scripts/test1.sh, scripts/test2.sh): ver más abajo y README. test1 = una VM alcanza; test2 = rampa hasta
-#   ocupar las 3 VMs. Variables: T1_PASOS T1_RPM T1_PASO_S  T2_PASOS T2_PASO_S T2_REPOSO_S CUBETA_T2  CARGA_T (ms de CPU por solicitud)  HILOS_T
+# test1 y test2 (scripts/test1.sh, scripts/test2.sh): ver más abajo y README. test1 = una VM alcanza (~1 min); test2 = rampa hasta
+#   ocupar las 3 VMs (~3 min). Variables: T1_PASOS T1_RPM T1_PASO_S  T2_PASOS T2_PASO_S T2_REPOSO_S CUBETA_T2  CARGA_T (ms de CPU por solicitud)  HILOS_T
+#   Son 3 veces más rápidas que antes (pasos de 10 s en vez de 30 s; escalado con T_SOSTENIDO_IN=5 y T_ENFRIAR_S=5 en vez de 10 y 8).
+#   Para la versión lenta de antes:  T1_PASO_S=30 T2_PASO_S=30 T2_REPOSO_S=45 T1_REPOSO_S=15 T_SOSTENIDO_IN=10 T_ENFRIAR_S=8 scripts/test2.sh
 # Etiquetas de las VMs en los informes (vms.conf): ET_GT ET_BD ET_VM4 ET_VM5 ET_GEN, p. ej. ET_BD="VM2-BD".
 # Si la capa lógica está toda en UNA VM, ponga IP_VM4 e IP_VM5 iguales a IP_GT (y ET_VM4="" ET_VM5=""):
 # 'escalable' arranca entonces el GT de relevo y las réplicas RMC en esa misma VM.
@@ -59,6 +61,7 @@ REPOSO_S=${REPOSO_S:-40}; METRICA=${METRICA:-max}
 RPM_ESC=${RPM_ESC:-0}        # solicitudes por minuto de cada cliente en 'escalamiento' (0 = sin pausa, máxima carga)
 CARGA_MS=${CARGA_MS:-0}      # CPU sintética por solicitud en cada RMC (ms); 0 = ninguna. Ver --carga-cpu-ms de bin/rmc
 TITULO_ESC=${TITULO_ESC:-}; VEREDICTO_ESC=${VEREDICTO_ESC:-}
+SOSTENIDO_OUT=${SOSTENIDO_OUT:-3}; SOSTENIDO_IN=${SOSTENIDO_IN:-10}; ENFRIAR_S=${ENFRIAR_S:-8}   # tiempos del escalado (s)
 EN_VIVO=${EN_VIVO:-1}        # segundos entre líneas del contador en vivo del generador (0 = apagado)
 HILOS_ESC=${HILOS_ESC:-4}; ASIENTOS_ESC=${ASIENTOS_ESC:-200000}
 ET_GT=${ET_GT-VM3(GT)}; ET_BD=${ET_BD-VM2(BD)}; ET_VM4=${ET_VM4-VM4}; ET_VM5=${ET_VM5-VM5}; ET_GEN=${ET_GEN-VM1(generador)}
@@ -179,7 +182,7 @@ arrancar() {  # arrancar <base|escalable|elastica>
     case $arq in
         escalamiento)   # niveles en orden de activación: base (VM3) -> vm4 -> vm5; el GT decide según la CPU de cada VM
             en "$IP_GT" "rm -f logs/escala.csv"
-            lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --escalar base,vm4,vm5 --umbral-out $UMBRAL_OUT --umbral-in $UMBRAL_IN --sostenido-out 3 --sostenido-in 10 --enfriar 8 --escala-metrica $METRICA --cubeta $CUBETA $( [ "$FUGA" != 0 ] && echo "--fuga $FUGA" ) --linea-tiempo logs/escala.csv --stats-csv logs/gt1.csv"
+            lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --escalar base,vm4,vm5 --umbral-out $UMBRAL_OUT --umbral-in $UMBRAL_IN --sostenido-out $SOSTENIDO_OUT --sostenido-in $SOSTENIDO_IN --enfriar $ENFRIAR_S --escala-metrica $METRICA --cubeta $CUBETA $( [ "$FUGA" != 0 ] && echo "--fuga $FUGA" ) --linea-tiempo logs/escala.csv --stats-csv logs/gt1.csv"
             local carga="" prio=""
             if [ "$CARGA_MS" != 0 ]; then carga="--carga-cpu-ms $CARGA_MS"; prio="nice -n 10 "; fi   # el GT pasa antes que el RMC de su VM
             lanzar "$IP_GT" rmc_base "${prio}bin/rmc --silencioso --nombre base --hilos $HILOS_ESC $carga --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
@@ -324,7 +327,7 @@ cmd_escalamiento() {
     { echo "version=$(head -1 VERSION 2>/dev/null)"; echo "fecha=$(date '+%F %T')"; echo "pasos=$PASOS"; echo "paso_s=$PASO_S"
       echo "reposo_s=$REPOSO_S"; echo "rpm_por_cliente=$RPM_ESC"; echo "carga_cpu_ms_por_solicitud=$CARGA_MS"
       echo "hilos_rmc_por_vm=$HILOS_ESC"; echo "hilos_bd=$HILOS_BD"; echo "umbral_out=$UMBRAL_OUT"; echo "umbral_in=$UMBRAL_IN"
-      echo "metrica=$METRICA"; echo "cubeta=$CUBETA"; echo "fuga=$FUGA"; echo "asientos_por_ocurrencia=$ASIENTOS_ESC"
+      echo "metrica=$METRICA"; echo "sostenido_out_s=$SOSTENIDO_OUT"; echo "sostenido_in_s=$SOSTENIDO_IN"; echo "enfriar_s=$ENFRIAR_S"; echo "cubeta=$CUBETA"; echo "fuga=$FUGA"; echo "asientos_por_ocurrencia=$ASIENTOS_ESC"
       echo "vm_gt=$IP_GT ($ET_GT)"; echo "vm_bd=$IP_BD ($ET_BD)"; echo "vm4=$IP_VM4 ($ET_VM4)"; echo "vm5=$IP_VM5 ($ET_VM5)"
       echo "generador=$ET_GEN"; } > "$SALIDA/config.txt"
     local i=0 fila nc npasos; npasos=$(echo $PASOS | wc -w)
@@ -367,7 +370,8 @@ cmd_escalamiento() {
 # test1: la carga cabe en UNA VM (VM3): no debe haber scale-out ni cubeta, y VM4/VM5 no reciben trabajo.
 cmd_test1() {
     SALIDA_ESC=${SALIDA_T1:-resultados_test1}
-    PASOS=${T1_PASOS:-"3 6 9"}; PASO_S=${T1_PASO_S:-30}; RPM_ESC=${T1_RPM:-600}; REPOSO_S=${T1_REPOSO_S:-15}
+    PASOS=${T1_PASOS:-"3 6 9"}; PASO_S=${T1_PASO_S:-10}; RPM_ESC=${T1_RPM:-600}; REPOSO_S=${T1_REPOSO_S:-5}
+    SOSTENIDO_IN=${T_SOSTENIDO_IN:-5}; ENFRIAR_S=${T_ENFRIAR_S:-5}   # escalado más ágil (3x más rápido que el 10 s / 8 s de 'escalamiento')
     CARGA_MS=${CARGA_T:-10}; HILOS_ESC=${HILOS_T:-8}
     TITULO_ESC="test1: una VM es suficiente para el tráfico"; VEREDICTO_ESC=test1
     echo "== test1: carga ligera (clientes $PASOS a ${RPM_ESC} solicitudes/min cada uno); debe atenderla solo VM3 =="
@@ -377,7 +381,8 @@ cmd_test1() {
 # test2: la carga crece hasta ocupar las 3 VMs: scale-out a vm4 y vm5, CPU al límite y leaky bucket.
 cmd_test2() {
     SALIDA_ESC=${SALIDA_T2:-resultados_test2}
-    PASOS=${T2_PASOS:-"2 4 8 12 16 24 32 48 64 96 128"}; PASO_S=${T2_PASO_S:-30}; RPM_ESC=0; REPOSO_S=${T2_REPOSO_S:-45}
+    PASOS=${T2_PASOS:-"2 4 8 12 16 24 32 48 64 96 128"}; PASO_S=${T2_PASO_S:-10}; RPM_ESC=0; REPOSO_S=${T2_REPOSO_S:-20}
+    SOSTENIDO_IN=${T_SOSTENIDO_IN:-5}; ENFRIAR_S=${T_ENFRIAR_S:-5}   # escalado más ágil (3x más rápido que el 10 s / 8 s de 'escalamiento')
     CARGA_MS=${CARGA_T:-10}; HILOS_ESC=${HILOS_T:-8}; CUBETA=${CUBETA_T2:-40}   # cubeta chica: con 24 trabajadores ocupados rechaza desde ~64 clientes
     TITULO_ESC="test2: carga creciente hasta ocupar las 3 VMs"; VEREDICTO_ESC=test2
     echo "== test2: rampa de clientes $PASOS sin pausa entre solicitudes; deben activarse vm4 y vm5 y la cubeta =="
