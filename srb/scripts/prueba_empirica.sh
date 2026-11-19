@@ -9,6 +9,9 @@
 #   scripts/prueba_empirica.sh correr escalable          RMC en VM4+VM5, persistencia multihilo, GT de relevo
 #   scripts/prueba_empirica.sh correr elastica           arranca como "base" y a los ELASTICA_S s une VM4 y VM5
 #                                                        EN PLENA CARGA (se ve el salto de throughput)
+#   scripts/prueba_empirica.sh procedimientos base|escalable
+#                                                        aísla cada procedimiento (consulta, reserva, modificación,
+#                                                        cancelación, mixto) y dice cuánta CPU gasta cada componente
 #   scripts/prueba_empirica.sh parar                     detiene los procesos del SRB en todas las VMs
 #
 # Configuración: copie scripts/vms.conf.ejemplo a scripts/vms.conf y ponga las IP reales.
@@ -17,6 +20,10 @@
 #
 # Variables opcionales: CLIENTES="3 5 8" REPS=1 DUR=60 CAL=10 HILOS_BD=4 HILOS_RMC=2 ASIENTOS=5000
 #                       ELASTICA_S=25 SALIDA=resultados_empiricos MODO=local (ensayo en una sola máquina)
+#                       CLIENTES_PROC=8 (clientes en 'procedimientos')  SALIDA_PROC=resultados_procedimientos
+# Etiquetas de las VMs en los informes (vms.conf): ET_GT ET_BD ET_VM4 ET_VM5 ET_GEN, p. ej. ET_BD="VM2-BD".
+# Si la capa lógica está toda en UNA VM, ponga IP_VM4 e IP_VM5 iguales a IP_GT (y ET_VM4="" ET_VM5=""):
+# 'escalable' arranca entonces el GT de relevo y las réplicas RMC en esa misma VM.
 set -u
 cd "$(dirname "$0")/.."
 CONF=${CONF:-scripts/vms.conf}
@@ -30,6 +37,8 @@ SSH_OPTS=${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecki
 CLIENTES=${CLIENTES:-"3 5 8"}; REPS=${REPS:-1}; DUR=${DUR:-60}; CAL=${CAL:-10}
 HILOS_BD=${HILOS_BD:-4}; HILOS_RMC=${HILOS_RMC:-2}; ASIENTOS=${ASIENTOS:-5000}
 ELASTICA_S=${ELASTICA_S:-25}
+CLIENTES_PROC=${CLIENTES_PROC:-8}
+ET_GT=${ET_GT-VM2(GT)}; ET_BD=${ET_BD-VM3(BD)}; ET_VM4=${ET_VM4-VM4}; ET_VM5=${ET_VM5-VM5}; ET_GEN=${ET_GEN-VM1(generador)}
 SALIDA=${SALIDA:-resultados_empiricos}
 HOSTS=$(printf '%s\n' "$IP_GT" "$IP_BD" "$IP_VM4" "$IP_VM5" | awk '!v[$0]++')
 
@@ -41,20 +50,20 @@ en() {  # en <ip> <comando>: ejecuta en esa VM, dentro de la carpeta del proyect
 lanzar() {  # lanzar <ip> <nombre_log> <comando>: arranca en segundo plano, sobrevive al cierre de ssh
     en "$1" "mkdir -p logs && (setsid nohup $3 > logs/$2.log 2>&1 < /dev/null &); sleep 0.2; true"
 }
-rol_de() {  # etiqueta de los roles que tiene una IP según vms.conf
+rol_de() {  # etiqueta (sin espacios) de los roles que tiene una IP según vms.conf
     local ip=$1 r=""
-    [ "$ip" = "$IP_GT" ] && r="$r+VM2(GT)"; [ "$ip" = "$IP_BD" ] && r="$r+VM3(BD)"
-    [ "$ip" = "$IP_VM4" ] && r="$r+VM4"; [ "$ip" = "$IP_VM5" ] && r="$r+VM5"
-    echo "${r#+}"
+    [ "$ip" = "$IP_GT" ] && [ -n "$ET_GT" ] && r="$r+$ET_GT"; [ "$ip" = "$IP_BD" ] && [ -n "$ET_BD" ] && r="$r+$ET_BD"
+    [ "$ip" = "$IP_VM4" ] && [ -n "$ET_VM4" ] && r="$r+$ET_VM4"; [ "$ip" = "$IP_VM5" ] && [ -n "$ET_VM5" ] && r="$r+$ET_VM5"
+    r=${r#+}; echo "${r:-$ip}" | tr ' ' '_'
 }
 
 cmd_mapa() {
-    echo "Según scripts/vms.conf:   VM2 (GT + cancelaciones) = $IP_GT   VM3 (BD) = $IP_BD   VM4 = $IP_VM4   VM5 = $IP_VM5"
+    echo "Según scripts/vms.conf:   GT+cancelaciones = $IP_GT ($(rol_de "$IP_GT"))   BD = $IP_BD ($(rol_de "$IP_BD"))   VM4 = $IP_VM4   VM5 = $IP_VM5"
     echo "Lo que dice cada máquina:"
     for ip in $HOSTS; do
         printf '  %-16s ' "$ip"; en "$ip" "scripts/quien_soy.sh --corto" 2>&1 | tail -1
     done
-    echo "(Esta máquina, VM1, es el generador: $(hostname) [$(hostname -I 2>/dev/null | awk '{print $1}')])"
+    echo "(Esta máquina es el generador, $ET_GEN: $(hostname) [$(hostname -I 2>/dev/null | awk '{print $1}')])"
 }
 
 cmd_verificar() {
@@ -136,7 +145,8 @@ arrancar() {  # arrancar <base|escalable|elastica>
     esperar_registro "$ESPERADOS"
 }
 
-perfil() {  # perfil del enunciado para N clientes
+perfil() {  # perfil del enunciado para N clientes (o el perfil fijado por 'procedimientos')
+    [ -n "${PERFIL_EXTRA:-}" ] && { echo "$PERFIL_EXTRA"; return; }
     case $1 in
         3) echo "--solo-consulta 2 --pct-consulta 50 --pct-reserva 50 --pct-modificar 0" ;;
         5) echo "--solo-consulta 3 --pct-consulta 0 --pct-reserva 70 --pct-modificar 30" ;;
@@ -144,11 +154,13 @@ perfil() {  # perfil del enunciado para N clientes
     esac
 }
 
-un_escenario() {  # un_escenario <arq> <clientes> <repeticion>
-    local arq=$1 N=$2 R=$3 etq="${1}_c${2}_r${3}" W=$((DUR - 3)) gts="tcp://$IP_GT:5555"
+un_escenario() {  # un_escenario <arq> <clientes> <repeticion> [etiqueta_de_procedimiento]
+    local arq=$1 N=$2 R=$3 W=$((DUR - 3)) gts="tcp://$IP_GT:5555" earq=$1 etq
+    [ -n "${4:-}" ] && earq="$1-$4"
+    etq="${earq}_c${N}_r${R}"
     [ "$arq" != base ] && gts="$gts,tcp://$IP_VM4:6555"
     mkdir -p "$SALIDA/tmp"; rm -f "$SALIDA"/tmp/*
-    echo; echo "== corrida $etq: $N clientes, ${CAL}s de calentamiento + ${DUR}s medidos =="
+    echo; echo "== corrida $etq: $N clientes, ${CAL}s de calentamiento + ${DUR}s medidos${PERFIL_EXTRA:+  [perfil: $PERFIL_EXTRA]} =="
     en "$IP_BD" "pkill -USR2 -f '[b]in/persistencia'"; sleep 4          # BD al estado inicial
     en "$IP_GT" "pkill -USR1 -f '[b]in/gestor .*GT1'; true"; sleep 1     # contadores del GT en cero
 
@@ -157,6 +169,10 @@ un_escenario() {  # un_escenario <arq> <clientes> <repeticion>
         en "$ip" "scripts/muestreo_cpu.sh $CAL $W '$(rol_de "$ip")'" > "$SALIDA/tmp/cpu_$ip.txt" 2>&1 &
         SAMPLERS+=($!)
     done
+    if [ "$MODO" != local ]; then   # la CPU de ESTA máquina (generador): si se satura, el cuello sería la carga y no el SRB
+        scripts/muestreo_cpu.sh "$CAL" "$W" "$(echo "$ET_GEN" | tr ' ' '_')" > "$SALIDA/tmp/cpu_generador.txt" 2>&1 &
+        SAMPLERS+=($!)
+    fi
     if [ "$arq" = elastica ]; then   # VM4 y VM5 se unen en plena carga
         ( sleep $((CAL + ELASTICA_S)); echo "   >>> $(date +%H:%M:%S) se unen RMC de VM4 y VM5 <<<"; lanzar_rmcs_vm4_vm5 ) &
         SAMPLERS+=($!)
@@ -164,7 +180,7 @@ un_escenario() {  # un_escenario <arq> <clientes> <repeticion>
     # shellcheck disable=SC2046
     timeout $((CAL + DUR + 40)) bin/generador --clientes "$N" $(perfil "$N") --rpm 0 \
         --duracion $((CAL + DUR)) --calentamiento "$CAL" --gt "$gts" --notif "tcp://$IP_GT:5558" \
-        --arquitectura "$arq" --repeticion "$R" --muestras "$SALIDA/${etq}_muestras.csv" \
+        --arquitectura "$earq" --repeticion "$R" --muestras "$SALIDA/${etq}_muestras.csv" \
         > "$SALIDA/${etq}.gen.log" 2>&1
     wait "${SAMPLERS[@]}" 2>/dev/null
 
@@ -186,7 +202,7 @@ un_escenario() {  # un_escenario <arq> <clientes> <repeticion>
              m=0; for(k in cpu) if(cpu[k]>m){m=cpu[k]; mk=k}
              if(tot>0) printf "   Componente que más CPU consume: %s (%.0f%% de la CPU del sistema)\n", mk, 100*m/tot }'
     cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="NODO" && $3>=85{printf "   *** nodo %s SATURADO (CPU total %d%%) ***\n",$2,$3}'
-    echo "$arq,$N,$R,$n" >> "$SALIDA/resumen.csv"
+    echo "$earq,$N,$R,$n" >> "$SALIDA/resumen.csv"
 }
 
 cmd_correr() {
@@ -210,8 +226,30 @@ cmd_correr() {
     echo "Guarde también la salida de esta ejecución (la CPU por componente es evidencia para el informe)."
 }
 
+cmd_procedimientos() {  # cada procedimiento por separado, para saber qué componente limita a cada uno
+    local arq=${1:-base} N=$CLIENTES_PROC
+    case $arq in base|escalable) ;; *) echo "Uso: $0 procedimientos base|escalable"; exit 2 ;; esac
+    test -x bin/generador || { echo "Falta bin/generador: haga 'make' en esta máquina"; exit 1; }
+    SALIDA=${SALIDA_PROC:-resultados_procedimientos}; mkdir -p "$SALIDA"
+    arrancar "$arq" || { echo "No se pudo completar el arranque (use '$0 parar' antes de reintentar)"; exit 1; }
+    local pr
+    for pr in consulta reserva modificacion cancelacion mixto; do
+        case $pr in   # (los porcentajes siempre suman 100; modificar/cancelar necesitan una reserva propia previa)
+            consulta)     PERFIL_EXTRA="--solo-consulta $N --pct-consulta 100 --pct-reserva 0 --pct-modificar 0 --pct-cancelar 0" ;;
+            reserva)      PERFIL_EXTRA="--solo-consulta 0 --pct-consulta 0 --pct-reserva 100 --pct-modificar 0 --pct-cancelar 0" ;;
+            modificacion) PERFIL_EXTRA="--solo-consulta 0 --pct-consulta 0 --pct-reserva 20 --pct-modificar 80 --pct-cancelar 0" ;;
+            cancelacion)  PERFIL_EXTRA="--solo-consulta 0 --pct-consulta 0 --pct-reserva 50 --pct-modificar 0 --pct-cancelar 50" ;;
+            mixto)        PERFIL_EXTRA="--solo-consulta 0 --pct-consulta 40 --pct-reserva 30 --pct-modificar 20 --pct-cancelar 10" ;;
+        esac
+        un_escenario "$arq" "$N" 1 "$pr"
+    done
+    PERFIL_EXTRA=""
+    echo; echo "Listo. Archivos en $SALIDA/ . Guarde también la salida de esta ejecución."
+}
+
 case "${1:-}" in
     mapa) cmd_mapa ;;
+    procedimientos) cmd_procedimientos "${2:-}" ;;
     verificar) cmd_verificar ;;
     correr) cmd_correr "${2:-}" ;;
     parar) parar_todo; echo "Procesos del SRB detenidos en: $HOSTS" ;;

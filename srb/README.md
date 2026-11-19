@@ -214,6 +214,30 @@ Cómo leerlo: si `postgres`+`persistencia` suman la mayor parte de la CPU y el n
 de botella es la base de datos y más RMC no mejora más; si VM3 tiene CPU de sobra y el throughput sube al añadir
 trabajadores, el límite era la concurrencia del RMC (cada solicitud ocupa un trabajador mientras espera a la BD).
 
+### Variante de 3 VMs (VM1 carga · VM2 BD · VM3 capa lógica) y cuello de botella por procedimiento
+
+Si toda la capa lógica (GT, RMC y cancelaciones) está en **una** VM, ponga en `scripts/vms.conf` las IP de esa VM en
+`IP_GT`, `IP_VM4` e `IP_VM5`; la de la BD en `IP_BD`; y las etiquetas que saldrán en los informes:
+
+```bash
+IP_GT=<IP VM3>  IP_BD=<IP VM2>  IP_VM4=<IP VM3>  IP_VM5=<IP VM3>
+ET_GT="VM3-logica"  ET_BD="VM2-BD"  ET_VM4=""  ET_VM5=""  ET_GEN="VM1-carga"
+```
+
+`correr escalable` arranca entonces el GT de relevo y dos réplicas RMC (`vm4`, `vm5`) en esa misma VM, así que mide si
+más réplicas ayudan cuando comparten los núcleos de la VM lógica. La CPU de **VM1** también se mide: si el generador se
+acerca al 85 %, el límite sería la carga y no el SRB.
+
+```bash
+DUR=40 CAL=8 CLIENTES_PROC=8 scripts/prueba_empirica.sh procedimientos base      | tee proc_base.txt
+DUR=40 CAL=8 CLIENTES_PROC=8 scripts/prueba_empirica.sh procedimientos escalable | tee proc_escalable.txt
+```
+
+`procedimientos` corre por separado consulta, reserva, modificación, cancelación y un perfil mixto (BD al estado inicial
+antes de cada uno) y, para cada uno, imprime tiempos y TPM, CPU por componente y nodo, ms de CPU por transacción y el
+componente que limita. Los CSV quedan en `resultados_procedimientos/`. En el perfil de cancelación el costo por
+transacción es por pareja reserva + cancelación (la cancelación es asíncrona: el cliente no mide su tiempo).
+
 ## Demostración de las fallas (sustentación)
 
 Con el generador corriendo (`--rpm 0` para ver el efecto):

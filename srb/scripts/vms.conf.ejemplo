@@ -12,3 +12,8 @@ IP_VM5=10.0.0.15                # VM5: RMC "vm5"
 # Opcional (valores por defecto entre paréntesis)
 # CLIENTES="3 5 8"   REPS=1   DUR=60 (segundos medidos)   CAL=10 (calentamiento)
 # HILOS_BD=4   HILOS_RMC=2   ASIENTOS=5000   ELASTICA_S=25
+
+# --- Topología de 3 VMs (VM1 carga, VM2 BD, VM3 TODA la capa lógica): descomente y ponga las IP reales
+# IP_GT=<IP de VM3>   IP_BD=<IP de VM2>   IP_VM4=<IP de VM3>   IP_VM5=<IP de VM3>
+# ET_GT="VM3-logica"  ET_BD="VM2-BD"      ET_VM4=""            ET_VM5=""            ET_GEN="VM1-carga"
+# CLIENTES_PROC=8   (clientes en 'prueba_empirica.sh procedimientos')
