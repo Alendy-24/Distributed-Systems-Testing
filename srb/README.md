@@ -1,6 +1,6 @@
 # SRB – Sistema de Reserva de Boletos (arquitectura base, primera entrega)
 
-Implementado: Cliente/Generador de carga, Gestor de Transacciones (GT), RMC,
+Implementado: Cliente/Generador de carga, Gestor de Transacciones (GT), RMC,A
 Servicio de Cancelaciones y Servicio de Persistencia (PostgreSQL), todo por ZeroMQ.
 Operaciones activas: **consulta** y **reserva** (síncronas) y **cancelación** (asíncrona,
 con notificación). La **modificación** responde ERROR (queda para la segunda entrega).
