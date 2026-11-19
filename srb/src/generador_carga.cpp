@@ -1,18 +1,27 @@
-// generador_carga.cpp  (Máquina 1: capa de consumidores)
-// GeneradorCarga crea un hilo por Cliente. Cada Cliente envía solicitudes al
-// Gestor de Transacciones (REQ) y escucha notificaciones (SUB). Metricas
-// guarda los tiempos de respuesta medidos con el reloj del propio cliente.
+// generador_carga.cpp  (capa de consumidores)
+// GeneradorCarga crea un hilo por Cliente. Cada Cliente envía solicitudes al Gestor de
+// Transacciones (REQ, con reintentos hacia el GT de relevo si el principal no responde) y
+// escucha notificaciones (SUB). Metricas guarda los tiempos de respuesta medidos con el reloj
+// del propio cliente.
 //
-// Uso: ./generador --clientes 3 --solo-consulta 2 --rpm 60 --duracion 120
-//        [--gt tcp://localhost:5555] [--notif tcp://localhost:5558]
-//        [--pct-consulta 70 --pct-reserva 30 --pct-cancelar 0]   (clientes mixtos)
+// Reparto entre VMs: se lanza el MISMO comando en cada VM de clientes, cambiando solo
+// --vm-indice (0, 1, ...). Cada proceso atiende los clientes cuyo índice global módulo
+// --vm-total coincide con su --vm-indice, así 8 clientes quedan 4 + 4 y el perfil de cada
+// cliente (solo consulta / mixto) se conserva.
+//
+// Uso: ./generador --clientes 8 --solo-consulta 4 --rpm 60 --duracion 120
+//        [--gt tcp://IP2:5555[,tcp://IP_RELEVO:5555]] [--notif tcp://IP2:5558]
+//        [--vm-indice 0 --vm-total 2]
+//        [--pct-consulta 40 --pct-reserva 40 --pct-modificar 20 --pct-cancelar 0]
 //        [--mes 202611] [--eventos 50] [--dobles 20] [--max-asientos 4]
-//        [--calentamiento 5] [--timeout-ms 5000] [--semilla 1]
-//        [--arquitectura base] [--csv resultados.csv]
+//        [--calentamiento 5] [--timeout-ms 4000] [--reintentos 3] [--semilla 1]
+//        [--arquitectura base|escalable] [--repeticion 1]
+//        [--csv resumen.csv] [--muestras muestras.csv]
 //   --rpm 0  = sin pausa entre solicitudes (máxima carga).
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <random>
 #include <thread>
 
@@ -21,44 +30,46 @@
 using namespace srb;
 
 // ---------------------------------------------------------------- Metricas --
+struct Muestra {
+    int tipo;
+    double ms;
+    double t;  // segundos desde el inicio de la corrida
+    int resultado;
+    int intentos;
+};
+
 class Metricas {
 public:
-    // Registra el tiempo de respuesta (ms) de una operación completada.
-    void registrar(TipoOperacion tipo, double ms) {
+    // Registra una operación completada (con respuesta) o con timeout.
+    void registrar(TipoOperacion tipo, double ms, double t, Estado e, int intentos, int cambios) {
         std::lock_guard<std::mutex> g(mtx);
-        if (tipo == TipoOperacion::CONSULTA) {
-            tiemposConsulta.push_back(ms);
-            contadorConsultas++;
-        } else {
-            tiemposReserva.push_back(ms);
-            contadorReservas++;
-        }
+        int i = idx(tipo);
+        tiempos[i].push_back(ms);
+        resultados[i][static_cast<int>(e)]++;
+        if (intentos > 1) reintentos++;
+        failovers += cambios;
+        muestras.push_back({static_cast<int>(tipo), ms, t, static_cast<int>(e), intentos});
     }
-    void registrarResultado(TipoOperacion tipo, Estado e) {
-        std::lock_guard<std::mutex> g(mtx);
-        if (e == Estado::RECHAZO) rechazos[idx(tipo)]++;
-        else if (e == Estado::ERROR) errores[idx(tipo)]++;
-    }
-    void registrarTimeout(TipoOperacion tipo) {
+    void registrarTimeout(TipoOperacion tipo, double t, int intentos, int cambios) {
         std::lock_guard<std::mutex> g(mtx);
         timeouts[idx(tipo)]++;  // aparte, para no distorsionar los promedios
+        failovers += cambios;
+        muestras.push_back({static_cast<int>(tipo), -1.0, t, 3, intentos});
     }
-    void registrarCancelacion() {
+    void registrarCancelacion() { std::lock_guard<std::mutex> g(mtx); cancelaciones++; }
+    void registrarNotificacion() { std::lock_guard<std::mutex> g(mtx); notificaciones++; }
+    // Cuenta TODAS las reservas confirmadas y los timeouts de reserva (incluso en el
+    // calentamiento): se contrastan con las filas de la tabla reserva de la BD.
+    void contarReservaTotal(bool exito, bool timeout) {
         std::lock_guard<std::mutex> g(mtx);
-        cancelaciones++;
-    }
-    void registrarNotificacion() {
-        std::lock_guard<std::mutex> g(mtx);
-        notificaciones++;
+        if (exito) reservasExitoTotal++;
+        if (timeout) reservasTimeoutTotal++;
     }
 
-    size_t n(TipoOperacion t) const {
-        std::lock_guard<std::mutex> g(mtx);
-        return vec(t).size();
-    }
+    size_t n(TipoOperacion t) const { std::lock_guard<std::mutex> g(mtx); return tiempos[idx(t)].size(); }
     double promedio(TipoOperacion t) const {
         std::lock_guard<std::mutex> g(mtx);
-        const auto& v = vec(t);
+        const auto& v = tiempos[idx(t)];
         if (v.empty()) return 0.0;
         double s = 0;
         for (double x : v) s += x;
@@ -68,7 +79,7 @@ public:
     double desviacionEstandar(TipoOperacion t) const {
         double p = promedio(t);
         std::lock_guard<std::mutex> g(mtx);
-        const auto& v = vec(t);
+        const auto& v = tiempos[idx(t)];
         if (v.size() < 2) return 0.0;
         double s = 0;
         for (double x : v) s += (x - p) * (x - p);
@@ -76,42 +87,49 @@ public:
     }
     double percentil95(TipoOperacion t) const {
         std::lock_guard<std::mutex> g(mtx);
-        std::vector<double> v = vec(t);
+        std::vector<double> v = tiempos[idx(t)];
         if (v.empty()) return 0.0;
         std::sort(v.begin(), v.end());
         size_t i = static_cast<size_t>(std::ceil(0.95 * v.size())) - 1;
         return v[std::min(i, v.size() - 1)];
     }
     // Transacciones por minuto vistas por el generador en la ventana medida.
-    double tpm(TipoOperacion t, double duracionSeg) const {
-        if (duracionSeg <= 0) return 0.0;
-        return n(t) / (duracionSeg / 60.0);
+    double tpm(TipoOperacion t, double ventanaSeg) const {
+        return ventanaSeg > 0 ? n(t) / (ventanaSeg / 60.0) : 0.0;
     }
-    long getRechazos(TipoOperacion t) const { std::lock_guard<std::mutex> g(mtx); return rechazos[idx(t)]; }
-    long getErrores(TipoOperacion t) const { std::lock_guard<std::mutex> g(mtx); return errores[idx(t)]; }
+    long getResultado(TipoOperacion t, Estado e) const {
+        std::lock_guard<std::mutex> g(mtx);
+        return resultados[idx(t)][static_cast<int>(e)];
+    }
     long getTimeouts(TipoOperacion t) const { std::lock_guard<std::mutex> g(mtx); return timeouts[idx(t)]; }
+    long getReintentos() const { std::lock_guard<std::mutex> g(mtx); return reintentos; }
+    long getFailovers() const { std::lock_guard<std::mutex> g(mtx); return failovers; }
     long getCancelaciones() const { std::lock_guard<std::mutex> g(mtx); return cancelaciones; }
     long getNotificaciones() const { std::lock_guard<std::mutex> g(mtx); return notificaciones; }
+    long getReservasExitoTotal() const { std::lock_guard<std::mutex> g(mtx); return reservasExitoTotal; }
+    long getReservasTimeoutTotal() const { std::lock_guard<std::mutex> g(mtx); return reservasTimeoutTotal; }
+    std::vector<Muestra> getMuestras() const { std::lock_guard<std::mutex> g(mtx); return muestras; }
 
 private:
-    static int idx(TipoOperacion t) { return t == TipoOperacion::CONSULTA ? 0 : 1; }
-    const std::vector<double>& vec(TipoOperacion t) const {
-        return t == TipoOperacion::CONSULTA ? tiemposConsulta : tiemposReserva;
+    static int idx(TipoOperacion t) {
+        return t == TipoOperacion::CONSULTA ? 0 : (t == TipoOperacion::RESERVA ? 1 : 2);
     }
     mutable std::mutex mtx;
-    std::vector<double> tiemposConsulta, tiemposReserva;
-    int contadorConsultas = 0, contadorReservas = 0;
-    long rechazos[2] = {0, 0}, errores[2] = {0, 0}, timeouts[2] = {0, 0};
-    long cancelaciones = 0, notificaciones = 0;
+    std::vector<double> tiempos[3];  // consulta, reserva, modificación
+    long resultados[3][3] = {};
+    long timeouts[3] = {0, 0, 0};
+    long reintentos = 0, failovers = 0, cancelaciones = 0, notificaciones = 0;
+    long reservasExitoTotal = 0, reservasTimeoutTotal = 0;
+    std::vector<Muestra> muestras;
 };
 
 // ----------------------------------------------------------------- Cliente --
 class Cliente {
 public:
-    Cliente(zmq::context_t& ctx, int id, const std::string& epGT, const std::string& epNotif,
-            int timeoutMs)
+    Cliente(zmq::context_t& ctx, int id, const std::vector<std::string>& gts,
+            const std::string& epNotif, int timeoutMs, int reintentos)
         : idCliente(id),
-          sockReq(ctx, epGT, timeoutMs),
+          sockReq(ctx, gts, timeoutMs, reintentos),
           sockSub(crearSocket(ctx, zmq::socket_type::sub)) {
         if (!epNotif.empty()) {
             sockSub.connect(epNotif);
@@ -120,8 +138,10 @@ public:
         }
     }
 
-    // false = no llegó respuesta a tiempo.
-    bool enviarSolicitud(const Mensaje& m, Mensaje& respuesta) { return sockReq.pedir(m, respuesta); }
+    // false = no llegó respuesta tras todos los intentos.
+    bool enviarSolicitud(const Mensaje& m, Mensaje& respuesta, int& intentos, int& cambios) {
+        return sockReq.pedir(m, respuesta, intentos, cambios);
+    }
 
     // Espera hasta esperaMs por una notificación de cancelación efectiva.
     bool recibirNotificacion(Mensaje& out, int esperaMs) {
@@ -134,16 +154,21 @@ public:
     int idCliente;
 
 private:
-    EnlaceREQ sockReq;
+    EnlaceGT sockReq;
     zmq::socket_t sockSub;
 };
 
 // ----------------------------------------------------------- GeneradorCarga --
 struct Parametros {
-    std::string gt, notif, arquitectura, csv;
-    int clientes, soloConsulta, rpm, duracion, calentamiento, timeoutMs, semilla;
-    int pctConsulta, pctReserva, pctCancelar;
-    int mes, eventos, dobles, maxAsientos;
+    std::vector<std::string> gts;
+    std::string notif, arquitectura, csv, muestras;
+    int clientes, soloConsulta, rpm, duracion, calentamiento, timeoutMs, reintentos, semilla;
+    int pctConsulta, pctReserva, pctModificar, pctCancelar;
+    int mes, eventos, dobles, maxAsientos, vmIndice, vmTotal, repeticion;
+};
+
+struct ReservaPropia {
+    int idReserva, idEvento, idOcurrencia, numAsientos;
 };
 
 class GeneradorCarga {
@@ -151,81 +176,131 @@ public:
     explicit GeneradorCarga(const Parametros& p) : p_(p), ctx_(1) {}
 
     void iniciar() {
-        logLinea("CARGA", "clientes=" + std::to_string(p_.clientes) + " (solo consulta: " +
-                              std::to_string(p_.soloConsulta) + ") rpm=" + std::to_string(p_.rpm) +
-                              " duracion=" + std::to_string(p_.duracion) + "s calentamiento=" +
-                              std::to_string(p_.calentamiento) + "s");
+        std::vector<int> mios;
+        for (int i = 0; i < p_.clientes; ++i)
+            if (i % p_.vmTotal == p_.vmIndice) mios.push_back(i);
+        int soloMios = 0;
+        for (int i : mios) soloMios += (i < p_.soloConsulta);
+        logLinea("CARGA", "VM " + std::to_string(p_.vmIndice) + "/" + std::to_string(p_.vmTotal) +
+                              ": " + std::to_string(mios.size()) + " de " + std::to_string(p_.clientes) +
+                              " clientes (solo consulta: " + std::to_string(soloMios) + ") rpm=" +
+                              std::to_string(p_.rpm) + " duracion=" + std::to_string(p_.duracion) +
+                              "s calentamiento=" + std::to_string(p_.calentamiento) + "s");
+        // Los idMensaje son únicos por corrida: así una corrida nueva nunca se confunde con
+        // un reintento de una anterior que sigue guardada en la BD.
+        base_ = static_cast<long>(std::time(nullptr) % 10000000L) * 1000000L;
         t0_ = ahoraSeg();
         std::vector<std::thread> hilos;
-        for (int i = 0; i < p_.clientes; ++i) hilos.emplace_back(&GeneradorCarga::cicloCliente, this, i);
+        for (int i : mios) hilos.emplace_back(&GeneradorCarga::cicloCliente, this, i);
         for (auto& h : hilos) h.join();
-        informar();
+        informar(static_cast<int>(mios.size()));
     }
 
-    // Construye la solicitud de un cliente según su perfil.
-    Mensaje generarSolicitud(int idCliente, int seq, bool soloConsulta, std::mt19937& rng,
-                             std::vector<int>& misReservas) {
+private:
+    // Perfil de un cliente: qué operación pide a continuación.
+    TipoOperacion elegirTipo(bool soloConsulta, std::mt19937& rng, bool hayReservas) {
+        if (soloConsulta) return TipoOperacion::CONSULTA;
+        int dado = static_cast<int>(rng() % 100);
+        TipoOperacion t;
+        if (dado < p_.pctConsulta) t = TipoOperacion::CONSULTA;
+        else if (dado < p_.pctConsulta + p_.pctReserva) t = TipoOperacion::RESERVA;
+        else if (dado < p_.pctConsulta + p_.pctReserva + p_.pctModificar) t = TipoOperacion::MODIFICACION;
+        else t = TipoOperacion::CANCELACION;
+        if ((t == TipoOperacion::MODIFICACION || t == TipoOperacion::CANCELACION) && !hayReservas)
+            t = TipoOperacion::RESERVA;  // no hay nada propio que modificar o cancelar
+        return t;
+    }
+
+    Mensaje generarSolicitud(int idCliente, long idMensaje, TipoOperacion t, std::mt19937& rng,
+                             std::vector<ReservaPropia>& misReservas,
+                             const std::map<int, std::vector<std::pair<int, int>>>& calendario) {
         Mensaje m;
-        m.idMensaje = idCliente * 100000 + seq;
+        m.idMensaje = idMensaje;
         m.idCliente = idCliente;
+        m.tipo = t;
         m.endpointCliente = "sub:" + p_.notif;
         m.tsEnvio = relojPared();
-
-        int dado = static_cast<int>(rng() % 100);
-        TipoOperacion t = TipoOperacion::CONSULTA;
-        if (!soloConsulta) {
-            if (dado < p_.pctConsulta) t = TipoOperacion::CONSULTA;
-            else if (dado < p_.pctConsulta + p_.pctReserva) t = TipoOperacion::RESERVA;
-            else t = misReservas.empty() ? TipoOperacion::RESERVA : TipoOperacion::CANCELACION;
-        }
-        m.tipo = t;
         if (t == TipoOperacion::CONSULTA) {
             m.mes = p_.mes;
         } else if (t == TipoOperacion::RESERVA) {
             m.idEvento = 1 + static_cast<int>(rng() % p_.eventos);
             m.idOcurrencia = (m.idEvento <= p_.dobles) ? 1 + static_cast<int>(rng() % 2) : 1;
             m.numAsientos = 1 + static_cast<int>(rng() % p_.maxAsientos);
+        } else if (t == TipoOperacion::MODIFICACION) {
+            const ReservaPropia& r = misReservas[rng() % misReservas.size()];
+            m.idReserva = r.idReserva;
+            m.idEvento = r.idEvento;
+            m.idOcurrencia = r.idOcurrencia;
+            m.numAsientos = r.numAsientos;
+            // Cambio de fecha solo si el evento tiene otra ocurrencia en el mes.
+            int fecha = 0;
+            auto it = calendario.find(r.idEvento);
+            if (it != calendario.end() && rng() % 2 == 0)
+                for (const auto& oc : it->second)
+                    if (oc.first != r.idOcurrencia) fecha = oc.second;
+            if (fecha > 0) m.fechaNueva = fecha;
+            else m.numAsientosNuevo = 1 + static_cast<int>(rng() % p_.maxAsientos);
         } else {  // CANCELACION de una reserva propia
             size_t i = rng() % misReservas.size();
-            m.idReserva = misReservas[i];
+            m.idReserva = misReservas[i].idReserva;
             misReservas.erase(misReservas.begin() + i);
         }
         return m;
     }
 
-private:
     void cicloCliente(int idx) {
-        const int idCliente = idx + 1;
+        const int idCliente = idx + 1;  // único en todo el sistema, aunque haya varias VMs
         const bool soloConsulta = idx < p_.soloConsulta;
-        Cliente cliente(ctx_, idCliente, p_.gt, p_.notif, p_.timeoutMs);
+        Cliente cliente(ctx_, idCliente, p_.gts, p_.notif, p_.timeoutMs, p_.reintentos);
         std::mt19937 rng(static_cast<unsigned>(p_.semilla) * 7919u + idCliente);
-        std::vector<int> misReservas;
+        std::vector<ReservaPropia> misReservas;
+        std::map<int, std::vector<std::pair<int, int>>> calendario;  // evento -> (ocurrencia, fecha)
         std::this_thread::sleep_for(std::chrono::milliseconds(300));  // que el SUB se conecte
+
+        long seq = 0;
+        auto actualizarCalendario = [&](const Mensaje& r) {
+            if (r.eventos.empty()) return;
+            calendario.clear();
+            for (const Evento& e : r.eventos) calendario[e.idEvento].push_back({e.idOcurrencia, e.fecha});
+        };
+        {   // consulta inicial (no se mide): para saber qué fechas tiene cada evento
+            Mensaje m = generarSolicitud(idCliente, base_ + (++seq),
+                                         TipoOperacion::CONSULTA, rng, misReservas, calendario), r;
+            int intentos, cambios;
+            if (cliente.enviarSolicitud(m, r, intentos, cambios)) actualizarCalendario(r);
+        }
 
         const double intervalo = p_.rpm > 0 ? 60.0 / p_.rpm : 0.0;
         const double fin = t0_ + p_.duracion;
-        int seq = 0;
-        while (ahoraSeg() < fin) {
+        while (ahoraSeg() < fin && !g_parar) {
             double inicioIter = ahoraSeg();
-            Mensaje m = generarSolicitud(idCliente, ++seq, soloConsulta, rng, misReservas);
+            TipoOperacion tipo = elegirTipo(soloConsulta, rng, !misReservas.empty());
+            Mensaje m = generarSolicitud(idCliente, base_ + (++seq),
+                                         tipo, rng, misReservas, calendario);
             Mensaje r;
+            int intentos = 0, cambios = 0;
             double ts = ahoraSeg();
-            bool ok = cliente.enviarSolicitud(m, r);
+            bool ok = cliente.enviarSolicitud(m, r, intentos, cambios);
             double ms = (ahoraSeg() - ts) * 1000.0;
-            bool medir = (ts - t0_) >= p_.calentamiento;  // se descartan los primeros segundos
+            double t = ts - t0_;
+            bool medir = t >= p_.calentamiento;  // se descartan los primeros segundos
 
-            if (m.tipo == TipoOperacion::CANCELACION) {
+            if (tipo == TipoOperacion::RESERVA) metricas.contarReservaTotal(ok && r.resultado == Estado::EXITO, !ok);
+            if (tipo == TipoOperacion::CANCELACION) {
                 if (ok && medir) metricas.registrarCancelacion();
             } else if (medir) {
-                if (!ok) {
-                    metricas.registrarTimeout(m.tipo);
-                } else {
-                    metricas.registrar(m.tipo, ms);
-                    metricas.registrarResultado(m.tipo, r.resultado);
-                }
+                if (!ok) metricas.registrarTimeout(tipo, t, intentos, cambios);
+                else metricas.registrar(tipo, ms, t, r.resultado, intentos, cambios);
             }
-            if (ok && m.tipo == TipoOperacion::RESERVA && r.resultado == Estado::EXITO)
-                misReservas.push_back(r.idReserva);
+            if (ok && tipo == TipoOperacion::CONSULTA) actualizarCalendario(r);
+            if (ok && tipo == TipoOperacion::RESERVA && r.resultado == Estado::EXITO)
+                misReservas.push_back({r.idReserva, r.idEvento, r.idOcurrencia, r.numAsientos});
+            if (ok && tipo == TipoOperacion::MODIFICACION && r.resultado == Estado::EXITO)
+                for (auto& rp : misReservas)
+                    if (rp.idReserva == r.idReserva) {
+                        rp.idOcurrencia = r.idOcurrencia;
+                        rp.numAsientos = r.numAsientos;
+                    }
 
             Mensaje nota;
             while (cliente.recibirNotificacion(nota, 0)) metricas.registrarNotificacion();
@@ -242,10 +317,11 @@ private:
         }
     }
 
-    void informar() {
+    void informar(int clientesAqui) {
         const double ventana = std::max(1.0, static_cast<double>(p_.duracion - p_.calentamiento));
-        const TipoOperacion C = TipoOperacion::CONSULTA, R = TipoOperacion::RESERVA;
-        char b[256];
+        const TipoOperacion C = TipoOperacion::CONSULTA, R = TipoOperacion::RESERVA,
+                            M = TipoOperacion::MODIFICACION;
+        char b[320];
         std::snprintf(b, sizeof b, "CONSULTA: n=%zu prom=%.2f ms std=%.2f p95=%.2f TPM=%.1f timeouts=%ld",
                       metricas.n(C), metricas.promedio(C), metricas.desviacionEstandar(C),
                       metricas.percentil95(C), metricas.tpm(C, ventana), metricas.getTimeouts(C));
@@ -253,32 +329,65 @@ private:
         std::snprintf(b, sizeof b,
                       "RESERVA:  n=%zu prom=%.2f ms std=%.2f p95=%.2f TPM=%.1f rechazos=%ld timeouts=%ld",
                       metricas.n(R), metricas.promedio(R), metricas.desviacionEstandar(R),
-                      metricas.percentil95(R), metricas.tpm(R, ventana), metricas.getRechazos(R),
-                      metricas.getTimeouts(R));
+                      metricas.percentil95(R), metricas.tpm(R, ventana),
+                      metricas.getResultado(R, Estado::RECHAZO), metricas.getTimeouts(R));
         logLinea("CARGA", b);
+        if (p_.pctModificar > 0) {
+            std::snprintf(b, sizeof b,
+                          "MODIFIC.: n=%zu prom=%.2f ms std=%.2f p95=%.2f TPM=%.1f rechazos=%ld timeouts=%ld",
+                          metricas.n(M), metricas.promedio(M), metricas.desviacionEstandar(M),
+                          metricas.percentil95(M), metricas.tpm(M, ventana),
+                          metricas.getResultado(M, Estado::RECHAZO), metricas.getTimeouts(M));
+            logLinea("CARGA", b);
+        }
+        long errores = metricas.getResultado(C, Estado::ERROR) + metricas.getResultado(R, Estado::ERROR) +
+                       metricas.getResultado(M, Estado::ERROR);
+        logLinea("CARGA", "errores=" + std::to_string(errores) + " reintentos=" +
+                              std::to_string(metricas.getReintentos()) + " cambios_de_GT=" +
+                              std::to_string(metricas.getFailovers()) + " reservas_confirmadas=" +
+                              std::to_string(metricas.getReservasExitoTotal()) + " reservas_sin_respuesta=" +
+                              std::to_string(metricas.getReservasTimeoutTotal()));
         if (p_.pctCancelar > 0)
             logLinea("CARGA", "cancelaciones enviadas=" + std::to_string(metricas.getCancelaciones()) +
                                   " notificaciones recibidas=" +
                                   std::to_string(metricas.getNotificaciones()));
 
+        if (!p_.muestras.empty()) {
+            bool existe = std::ifstream(p_.muestras).good();
+            std::ofstream f(p_.muestras, std::ios::app);
+            if (!existe)
+                f << "arquitectura,repeticion,clientes,vm_indice,tipo,ms,t_s,resultado,intentos,ventana_s\n";
+            for (const Muestra& s : metricas.getMuestras()) {
+                f << p_.arquitectura << ',' << p_.repeticion << ',' << p_.clientes << ',' << p_.vmIndice
+                  << ',' << nombre(static_cast<TipoOperacion>(s.tipo)) << ',' << s.ms << ',' << s.t << ','
+                  << (s.resultado == 3 ? "TIMEOUT" : nombre(static_cast<Estado>(s.resultado))) << ','
+                  << s.intentos << ',' << ventana << '\n';
+            }
+            logLinea("CARGA", "muestras agregadas a " + p_.muestras);
+        }
         if (p_.csv.empty()) return;
         bool existe = std::ifstream(p_.csv).good();
         std::ofstream f(p_.csv, std::ios::app);
         if (!existe)
-            f << "arquitectura,clientes,solo_consulta,duracion_s,calentamiento_s,"
-                 "consultas_n,consulta_prom_ms,consulta_std_ms,consulta_p95_ms,consulta_tpm,"
-                 "consulta_timeouts,reservas_n,reserva_prom_ms,reserva_std_ms,reserva_p95_ms,"
-                 "reserva_tpm,reserva_rechazos,reserva_timeouts,cancelaciones,notificaciones\n";
-        char fila[512];
+            f << "arquitectura,repeticion,clientes,solo_consulta,vm_indice,vm_total,clientes_en_vm,"
+                 "duracion_s,calentamiento_s,consultas_n,consulta_prom_ms,consulta_std_ms,"
+                 "consulta_p95_ms,consulta_tpm,consulta_timeouts,reservas_n,reserva_prom_ms,"
+                 "reserva_std_ms,reserva_p95_ms,reserva_tpm,reserva_rechazos,reserva_timeouts,"
+                 "modif_n,modif_prom_ms,errores,reintentos,cambios_de_gt,reservas_confirmadas,"
+                 "reservas_sin_respuesta,cancelaciones,notificaciones\n";
+        char fila[900];
         std::snprintf(fila, sizeof fila,
-                      "%s,%d,%d,%d,%d,%zu,%.3f,%.3f,%.3f,%.2f,%ld,%zu,%.3f,%.3f,%.3f,%.2f,%ld,%ld,%ld,%ld\n",
-                      p_.arquitectura.c_str(), p_.clientes, p_.soloConsulta, p_.duracion,
-                      p_.calentamiento, metricas.n(C), metricas.promedio(C),
-                      metricas.desviacionEstandar(C), metricas.percentil95(C), metricas.tpm(C, ventana),
-                      metricas.getTimeouts(C), metricas.n(R), metricas.promedio(R),
+                      "%s,%d,%d,%d,%d,%d,%d,%d,%d,%zu,%.3f,%.3f,%.3f,%.2f,%ld,%zu,%.3f,%.3f,%.3f,%.2f,"
+                      "%ld,%ld,%zu,%.3f,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+                      p_.arquitectura.c_str(), p_.repeticion, p_.clientes, p_.soloConsulta, p_.vmIndice,
+                      p_.vmTotal, clientesAqui, p_.duracion, p_.calentamiento, metricas.n(C),
+                      metricas.promedio(C), metricas.desviacionEstandar(C), metricas.percentil95(C),
+                      metricas.tpm(C, ventana), metricas.getTimeouts(C), metricas.n(R), metricas.promedio(R),
                       metricas.desviacionEstandar(R), metricas.percentil95(R), metricas.tpm(R, ventana),
-                      metricas.getRechazos(R), metricas.getTimeouts(R), metricas.getCancelaciones(),
-                      metricas.getNotificaciones());
+                      metricas.getResultado(R, Estado::RECHAZO), metricas.getTimeouts(R), metricas.n(M),
+                      metricas.promedio(M), errores, metricas.getReintentos(), metricas.getFailovers(),
+                      metricas.getReservasExitoTotal(), metricas.getReservasTimeoutTotal(),
+                      metricas.getCancelaciones(), metricas.getNotificaciones());
         f << fila;
         logLinea("CARGA", "fila agregada a " + p_.csv);
     }
@@ -287,34 +396,42 @@ private:
     zmq::context_t ctx_;
     Metricas metricas;
     double t0_ = 0.0;
+    long base_ = 0;
 };
 
 int main(int argc, char** argv) {
+    instalarSenales();
     Parametros p;
-    p.gt = argStr(argc, argv, "--gt", "tcp://localhost:5555");
-    p.notif = argStr(argc, argv, "--notif", "tcp://localhost:5558");
+    p.gts = dividir(argStr(argc, argv, "--gt", "tcp://localhost:5555"), ',');
+    p.notif = argStr(argc, argv, "--notif", "");
     p.arquitectura = argStr(argc, argv, "--arquitectura", "base");
     p.csv = argStr(argc, argv, "--csv", "");
+    p.muestras = argStr(argc, argv, "--muestras", "");
     p.clientes = argInt(argc, argv, "--clientes", 3);
     p.soloConsulta = argInt(argc, argv, "--solo-consulta", 2);
     p.rpm = argInt(argc, argv, "--rpm", 60);
     p.duracion = argInt(argc, argv, "--duracion", 120);
     p.calentamiento = argInt(argc, argv, "--calentamiento", 5);
-    p.timeoutMs = argInt(argc, argv, "--timeout-ms", 5000);
+    p.timeoutMs = argInt(argc, argv, "--timeout-ms", 4000);
+    p.reintentos = argInt(argc, argv, "--reintentos", 3);
     p.semilla = argInt(argc, argv, "--semilla", 1);
-    p.pctConsulta = argInt(argc, argv, "--pct-consulta", 70);
-    p.pctReserva = argInt(argc, argv, "--pct-reserva", 30);
+    p.pctConsulta = argInt(argc, argv, "--pct-consulta", 40);
+    p.pctReserva = argInt(argc, argv, "--pct-reserva", 40);
+    p.pctModificar = argInt(argc, argv, "--pct-modificar", 20);
     p.pctCancelar = argInt(argc, argv, "--pct-cancelar", 0);
     p.mes = argInt(argc, argv, "--mes", 202611);
     p.eventos = std::max(1, argInt(argc, argv, "--eventos", 50));
     p.dobles = argInt(argc, argv, "--dobles", 20);
     p.maxAsientos = std::max(1, argInt(argc, argv, "--max-asientos", 4));
-    if (p.pctConsulta + p.pctReserva + p.pctCancelar != 100) {
-        std::fprintf(stderr, "Los porcentajes (consulta+reserva+cancelar) deben sumar 100\n");
+    p.vmIndice = argInt(argc, argv, "--vm-indice", 0);
+    p.vmTotal = std::max(1, argInt(argc, argv, "--vm-total", 1));
+    p.repeticion = argInt(argc, argv, "--repeticion", 1);
+    if (p.pctConsulta + p.pctReserva + p.pctModificar + p.pctCancelar != 100) {
+        std::fprintf(stderr, "Los porcentajes (consulta+reserva+modificar+cancelar) deben sumar 100\n");
         return 1;
     }
-    if (p.clientes < 1 || p.soloConsulta > p.clientes) {
-        std::fprintf(stderr, "Revise --clientes y --solo-consulta\n");
+    if (p.clientes < 1 || p.soloConsulta > p.clientes || p.vmIndice < 0 || p.vmIndice >= p.vmTotal) {
+        std::fprintf(stderr, "Revise --clientes, --solo-consulta, --vm-indice y --vm-total\n");
         return 1;
     }
     GeneradorCarga g(p);

@@ -1,0 +1,14 @@
+# Copie este archivo a scripts/vms.conf (cp scripts/vms.conf.ejemplo scripts/vms.conf) y ponga las IP REALES.
+# Cada línea es un valor de shell: sin espacios alrededor del "=". Este archivo se usa desde VM1 (el generador).
+
+USUARIO=ubuntu                  # usuario de ssh en las otras VMs (el mismo en todas)
+RUTA=/home/ubuntu/srb           # carpeta del proyecto, IGUAL en todas las VMs (ya compilada con make)
+
+IP_GT=10.0.0.12                 # VM2: GT principal + cancelaciones
+IP_BD=10.0.0.13                 # VM3: PostgreSQL + persistencia
+IP_VM4=10.0.0.14                # VM4: RMC "vm4" + GT de relevo
+IP_VM5=10.0.0.15                # VM5: RMC "vm5"
+
+# Opcional (valores por defecto entre paréntesis)
+# CLIENTES="3 5 8"   REPS=1   DUR=60 (segundos medidos)   CAL=10 (calentamiento)
+# HILOS_BD=4   HILOS_RMC=2   ASIENTOS=5000   ELASTICA_S=25

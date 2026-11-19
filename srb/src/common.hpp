@@ -1,7 +1,9 @@
 // common.hpp
-// Tipos compartidos (según el diagrama de clases), serialización de mensajes
-// y utilidades de ZeroMQ para todos los procesos del SRB.
+// Tipos compartidos (según el diagrama de clases), serialización de mensajes,
+// utilidades de ZeroMQ y el enlace con reintentos (Lazy Pirate) de los clientes.
 #pragma once
+
+#include <unistd.h>
 
 #include <zmq.hpp>
 
@@ -62,15 +64,20 @@ struct Reserva {
 };
 
 // Mensaje común a todos los componentes.
-//  - mes: formato AAAAMM (ej. 202611).
-//  - fechaNueva: formato AAAAMMDD.
-//  - Dentro de la capa de negocio y hacia Persistencia:
-//      CONSULTA con mes > 0   -> lista de eventos del mes
-//      CONSULTA con mes == 0  -> disponibilidad de (idEvento, idOcurrencia)
-//      RESERVA                -> reservar numAsientos
-//      CANCELACION            -> liberar los asientos de idReserva
+//  - mes: formato AAAAMM (ej. 202611).  fechaNueva: formato AAAAMMDD.
+//  - (idCliente, idMensaje) identifica la solicitud: un reintento conserva ambos,
+//    así Persistencia reconoce los duplicados y no repite la operación.
+//  - CONSULTA con mes > 0          -> lista de eventos del mes
+//    CONSULTA con mes == 0         -> disponibilidad de (idEvento, idOcurrencia)
+//                                     o, si fechaNueva > 0, de la ocurrencia de idEvento en esa fecha
+//  - RESERVA                       -> reservar numAsientos de (idEvento, idOcurrencia)
+//  - MODIFICACION                  -> sobre idReserva: fechaNueva > 0 cambia de ocurrencia
+//                                     conservando los asientos; si no, numAsientosNuevo cambia
+//                                     el número de asientos. (idEvento, idOcurrencia, numAsientos
+//                                     son los valores actuales que conoce el cliente.)
+//  - CANCELACION                   -> liberar los asientos de idReserva
 struct Mensaje {
-    int idMensaje = 0;
+    long idMensaje = 0;  // único por solicitud y por corrida; un reintento lo conserva
     TipoOperacion tipo = TipoOperacion::CONSULTA;
     int idCliente = 0;
     std::string endpointCliente;
@@ -133,7 +140,7 @@ inline bool deserializar(const std::string& s, Mensaje& m) {
         std::vector<std::string> f = dividir(s, '|');
         if (f.size() != 14) return false;
         Mensaje r;
-        r.idMensaje = std::stoi(f[0]);
+        r.idMensaje = std::stol(f[0]);
         int t = std::stoi(f[1]);
         if (t < 0 || t > 3) return false;
         r.tipo = static_cast<TipoOperacion>(t);
@@ -173,17 +180,22 @@ inline bool deserializar(const std::string& s, Mensaje& m) {
 
 inline std::string describir(const Mensaje& m) {
     std::ostringstream o;
-    o << nombre(m.tipo) << " msg=" << m.idMensaje << " cli=" << m.idCliente;
+    o << nombre(m.tipo) << " cli=" << m.idCliente << " msg=" << m.idMensaje;
     switch (m.tipo) {
         case TipoOperacion::CONSULTA:
             if (m.mes > 0) o << " mes=" << m.mes;
+            else if (m.fechaNueva > 0) o << " E" << m.idEvento << " fecha=" << m.fechaNueva;
             else o << " E" << m.idEvento << "/occ" << m.idOcurrencia;
             break;
         case TipoOperacion::RESERVA:
             o << " E" << m.idEvento << "/occ" << m.idOcurrencia << " asientos=" << m.numAsientos;
             break;
         case TipoOperacion::CANCELACION: o << " reserva=" << m.idReserva; break;
-        case TipoOperacion::MODIFICACION: o << " reserva=" << m.idReserva; break;
+        case TipoOperacion::MODIFICACION:
+            o << " reserva=" << m.idReserva;
+            if (m.fechaNueva > 0) o << " fecha->" << m.fechaNueva;
+            else o << " asientos->" << m.numAsientosNuevo;
+            break;
     }
     return o.str();
 }
@@ -202,8 +214,16 @@ inline double relojPared() {
     return duration<double>(system_clock::now().time_since_epoch()).count();
 }
 
-// Una línea de log por operación (para ver qué hace cada proceso en la sustentación).
-inline void logLinea(const std::string& componente, const std::string& texto) {
+inline std::string nombreMaquina() {
+    char b[128] = {0};
+    if (gethostname(b, sizeof b - 1) != 0) return "maquina";
+    return b;
+}
+
+// Con --silencioso se omiten las líneas por operación (se usa al medir desempeño).
+inline bool g_silencio = false;
+
+inline void imprimirLinea(const std::string& componente, const std::string& texto) {
     static std::mutex mtx;
     std::lock_guard<std::mutex> g(mtx);
     using namespace std::chrono;
@@ -216,6 +236,16 @@ inline void logLinea(const std::string& componente, const std::string& texto) {
     std::strftime(buf, sizeof buf, "%H:%M:%S", &tmv);
     std::printf("[%s.%03d] [%s] %s\n", buf, ms, componente.c_str(), texto.c_str());
     std::fflush(stdout);
+}
+
+// Línea de log que siempre se imprime (arranque, fallas, estadísticas).
+inline void logLinea(const std::string& componente, const std::string& texto) {
+    imprimirLinea(componente, texto);
+}
+
+// Una línea por operación (para ver qué hace cada proceso en la sustentación).
+inline void logOp(const std::string& componente, const std::string& texto) {
+    if (!g_silencio) imprimirLinea(componente, texto);
 }
 
 // Argumentos: --nombre valor
@@ -236,12 +266,15 @@ inline bool argFlag(int argc, char** argv, const std::string& nombre) {
     return false;
 }
 
-// Señales: SIGINT/SIGTERM detienen el proceso; SIGUSR1 pide volcar el estado de la BD.
+// Señales: SIGINT/SIGTERM detienen el proceso; SIGUSR1 vuelca estado/estadísticas;
+// SIGUSR2 (solo Persistencia) restablece la BD al estado inicial.
 inline volatile std::sig_atomic_t g_parar = 0;
 inline volatile std::sig_atomic_t g_volcar = 0;
+inline volatile std::sig_atomic_t g_reiniciar = 0;
 
 inline void alSenal(int s) {
     if (s == SIGUSR1) g_volcar = 1;
+    else if (s == SIGUSR2) g_reiniciar = 1;
     else g_parar = 1;
 }
 
@@ -253,6 +286,7 @@ inline void instalarSenales() {
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGUSR1, &sa, nullptr);
+    sigaction(SIGUSR2, &sa, nullptr);
 }
 
 // ---------------------------------------------------------- ZeroMQ helpers --
@@ -261,6 +295,11 @@ inline zmq::socket_t crearSocket(zmq::context_t& ctx, zmq::socket_type tipo) {
     zmq::socket_t s(ctx, tipo);
     s.set(zmq::sockopt::linger, 0);
     return s;
+}
+
+// Identidad fija para sockets DEALER (el GT la usa para reconocer a cada RMC).
+inline void fijarIdentidad(zmq::socket_t& s, const std::string& id) {
+    zmq_setsockopt(static_cast<void*>(s), ZMQ_ROUTING_ID, id.data(), id.size());
 }
 
 // Espera hasta ms milisegundos a que el socket tenga algo para leer.
@@ -286,10 +325,12 @@ inline bool recibirMultipart(zmq::socket_t& s, std::vector<std::string>& tramas)
     }
 }
 
-inline bool enviarMultipart(zmq::socket_t& s, const std::vector<std::string>& tramas) {
+inline bool enviarMultipart(zmq::socket_t& s, const std::vector<std::string>& tramas,
+                            bool sinBloquear = false) {
     try {
         for (size_t i = 0; i < tramas.size(); ++i) {
             auto flag = (i + 1 < tramas.size()) ? zmq::send_flags::sndmore : zmq::send_flags::none;
+            if (sinBloquear) flag = flag | zmq::send_flags::dontwait;
             auto r = s.send(zmq::buffer(tramas[i]), flag);
             if (!r) return false;
         }
@@ -300,7 +341,7 @@ inline bool enviarMultipart(zmq::socket_t& s, const std::vector<std::string>& tr
 }
 
 // Socket REQ con timeout. Si no llega respuesta a tiempo, el socket REQ queda
-// inutilizable, así que se cierra y se abre uno nuevo (patrón "Lazy Pirate").
+// inutilizable, así que se cierra y se abre uno nuevo.
 class EnlaceREQ {
 public:
     EnlaceREQ(zmq::context_t& ctx, std::string endpoint, int timeoutMs)
@@ -344,5 +385,72 @@ private:
     int timeoutMs_;
     zmq::socket_t sock_;
 };
+
+// Enlace de un Cliente con el Gestor de Transacciones (patrón Lazy Pirate).
+// Recibe una lista de GT (el titular primero, luego los de relevo). Si no hay respuesta
+// a tiempo, abre un socket nuevo hacia el siguiente GT y REPITE la misma solicitud con el
+// mismo (idCliente, idMensaje): Persistencia reconoce el duplicado y no la ejecuta dos veces.
+class EnlaceGT {
+public:
+    EnlaceGT(zmq::context_t& ctx, std::vector<std::string> endpoints, int timeoutMs, int reintentos)
+        : ctx_(ctx), eps_(std::move(endpoints)), timeoutMs_(timeoutMs), reintentos_(reintentos) {
+        if (eps_.empty()) eps_.push_back("tcp://localhost:5555");
+        abrir();
+    }
+
+    // false = se agotaron los intentos. intentos = envíos realizados; cambios = veces que se
+    // pasó a otro GT durante esta solicitud.
+    bool pedir(const Mensaje& req, Mensaje& resp, int& intentos, int& cambios) {
+        intentos = 0;
+        cambios = 0;
+        std::string datos = serializar(req);
+        for (int k = 0; k <= reintentos_ && !g_parar; ++k) {
+            ++intentos;
+            bool ok = false;
+            try {
+                auto s = sock_.send(zmq::buffer(datos), zmq::send_flags::none);
+                if (s) {
+                    zmq::message_t msg;
+                    auto r = sock_.recv(msg, zmq::recv_flags::none);
+                    if (r) {
+                        std::string payload(static_cast<const char*>(msg.data()), msg.size());
+                        if (deserializar(payload, resp)) ok = true;
+                    }
+                }
+            } catch (const zmq::error_t&) {
+            }
+            if (ok) return true;
+            if (eps_.size() > 1) {
+                actual_ = (actual_ + 1) % eps_.size();
+                ++cambios;
+            }
+            abrir();  // un REQ que no recibió respuesta no se puede reutilizar
+        }
+        return false;
+    }
+
+    const std::string& actual() const { return eps_[actual_]; }
+
+private:
+    void abrir() {
+        sock_ = crearSocket(ctx_, zmq::socket_type::req);
+        sock_.set(zmq::sockopt::rcvtimeo, timeoutMs_);
+        sock_.set(zmq::sockopt::sndtimeo, timeoutMs_);
+        sock_.connect(eps_[actual_]);
+    }
+
+    zmq::context_t& ctx_;
+    std::vector<std::string> eps_;
+    size_t actual_ = 0;
+    int timeoutMs_;
+    int reintentos_;
+    zmq::socket_t sock_;
+};
+
+// Comandos del protocolo GT <-> RMC (Paranoid Pirate): tramas [cmd], [cmd, corr, mensaje].
+inline const char* CMD_READY = "READY";
+inline const char* CMD_HB = "HB";
+inline const char* CMD_REQ = "REQ";
+inline const char* CMD_REP = "REP";
 
 }  // namespace srb

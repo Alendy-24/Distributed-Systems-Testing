@@ -1,10 +1,11 @@
-// servicio_cancelaciones.cpp  (Máquina 2: capa de lógica de negocio)
-// Servicio de Cancelaciones y Notificaciones. Recibe cancelaciones del GT por
-// PUSH/PULL, ordena a Persistencia liberar los asientos (REQ/REP) y avisa al
-// cliente por PUB/SUB con el id del cliente como tópico.
+// servicio_cancelaciones.cpp  (capa de lógica de negocio)
+// Servicio de Cancelaciones y Notificaciones. Recibe cancelaciones del GT por PUSH/PULL
+// (de uno o varios GT), ordena a Persistencia liberar los asientos (REQ/REP) y avisa al
+// cliente por PUB/SUB con el id del cliente como tópico. Se pueden lanzar varias copias
+// (cada una con su propio puerto PUB) y el PUSH del GT reparte entre ellas.
 //
 // Uso: ./cancelaciones [--bind-pull tcp://*:5557] [--bind-pub tcp://*:5558]
-//                      [--persistencia tcp://localhost:5559] [--timeout-ms 5000]
+//                      [--persistencia tcp://localhost:5559] [--timeout-ms 5000] [--silencioso]
 #include "common.hpp"
 
 using namespace srb;
@@ -44,7 +45,7 @@ public:
             r.resultado = Estado::ERROR;
             logLinea("CANCELACIONES", "sin respuesta de Persistencia (timeout)");
         }
-        logLinea("CANCELACIONES", describir(m) + " -> " + nombre(r.resultado));
+        logOp("CANCELACIONES", describir(m) + " -> " + nombre(r.resultado));
         notificarCliente(r);
     }
 
@@ -52,7 +53,7 @@ public:
     void notificarCliente(const Mensaje& r) {
         std::string topico = "c" + std::to_string(r.idCliente) + "|";
         enviarMultipart(sockPub, {topico, serializar(r)});
-        logLinea("CANCELACIONES", "notificación enviada a cliente " + std::to_string(r.idCliente));
+        logOp("CANCELACIONES", "notificación enviada a cliente " + std::to_string(r.idCliente));
     }
 
 private:
@@ -64,6 +65,7 @@ private:
 
 int main(int argc, char** argv) {
     instalarSenales();
+    g_silencio = argFlag(argc, argv, "--silencioso");
     try {
         ServicioCancelaciones c(argStr(argc, argv, "--bind-pull", "tcp://*:5557"),
                                 argStr(argc, argv, "--bind-pub", "tcp://*:5558"),

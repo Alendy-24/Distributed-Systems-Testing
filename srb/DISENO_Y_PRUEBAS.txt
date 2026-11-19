@@ -1,0 +1,386 @@
+SRB - SISTEMA DE RESERVA DE BOLETOS
+SEGUNDA ENTREGA: DISEÑO ESCALABLE Y TOLERANTE A FALLAS + PRUEBAS PARA EL INFORME
+Pontificia Universidad Javeriana - Introducción a Sistemas Distribuidos - 2026-30
+===============================================================================
+
+LEA PRIMERO (honestidad sobre lo verificado)
+--------------------------------------------
+* TODO lo que se probó se probó en UNA sola máquina de 2 núcleos (los procesos simulan las VMs con
+  puertos y nombres distintos). Funcionalidad, concurrencia, reparto equitativo, caída de un RMC, caída
+  del GT principal, supervisor y generador repartido: verificados y automatizados (sección 7).
+* El despliegue real en 5 VMs NO se pudo probar desde aquí. Los comandos están en el README; si algo falla
+  (firewall, IP, versión de libpqxx 6.4 en las VMs frente a la 7.8 de aquí) pásenme el mensaje y lo corrijo.
+  Usé solo funciones de libpqxx que existen en la 6.x, pero no pude compilar con esa versión.
+* Los números de rendimiento obtenidos aquí NO sirven para el informe (una sola máquina, cliente y servidor
+  compiten por la misma CPU). Las tablas y gráficos del informe salen de correr scripts/tabla1.sh en sus VMs.
+* Interpretación de "distribuyendo equitativamente entre 2 VMs libres": (a) el trabajo del RMC se reparte por
+  igual entre VM4 y VM5 (el GT lo mide e imprime: 51.4% / 48.6% en las pruebas), y (b) el generador de carga
+  puede dividirse entre 2 VMs (--vm-indice 0/1 --vm-total 2). NO implementé la idea de activar las 2 VMs por
+  umbrales de carga (arranque dinámico): las 2 réplicas están siempre activas.
+
+
+1. QUÉ CAMBIÓ RESPECTO A LA PRIMERA ENTREGA
+-------------------------------------------
+Primera entrega (base): 1 cliente -> 1 GT -> 1 RMC -> 1 Persistencia, REQ/REP en cadena, sin fallas, sin
+modificación.
+Ahora:
+  - Modificación de reservas (asientos o fecha a otra ocurrencia del mismo evento del mismo mes).
+  - GT <-> RMC pasa a ROUTER/DEALER con registro de trabajadores (READY), heartbeats y reparto LRU: se pueden
+    tener N réplicas de RMC en varias VMs sin cambiar nada más.
+  - RMC multihilo (--hilos): cada hilo es un trabajador independiente.
+  - Persistencia multihilo: un ROUTER hacia afuera y un DEALER interno reparten las solicitudes a N hilos REP,
+    cada uno con su propia conexión a PostgreSQL (la BD atiende las transacciones en paralelo).
+  - Tolerancia a fallas: detección por heartbeats, reasignación de la solicitud en curso, GT de relevo,
+    cliente con reintentos (Lazy Pirate) e idempotencia en la BD para que un reintento no duplique nada.
+  - idMensaje de 64 bits y tabla "transaccion" (clave idCliente+idMensaje) para la idempotencia.
+  - Generador de carga: reparto entre VMs, modificaciones, métricas (promedio, desviación, p95, TPM),
+    muestras crudas por solicitud (CSV) para el análisis.
+  - Herramientas nuevas: bin/cliente (archivo de operaciones = caso del profesor), scripts de prueba,
+    supervisor, controlador de la Tabla 1 y análisis con pandas/matplotlib.
+
+
+2. ARQUITECTURA FINAL Y DESPLIEGUE (5 VMs)
+------------------------------------------
+
+   VM1 (consumidores)          VM2 (negocio: entrada)             VM3 (almacenamiento)
+  +-------------------+       +---------------------------+      +-----------------------+
+  | generador / cliente|--REQ->| GT principal   :5555      |      | Persistencia  :5559   |
+  |  (+SUB notif)      |<-PUB--| Cancelaciones  :5557/5558 |      |  ROUTER -> DEALER ->  |
+  +-------------------+       |   ^ ROUTER RMC :5556      |      |  N hilos REP -> PG    |
+          |                   +-----|---------------------+      |  PostgreSQL (srb)     |
+          |  (relevo)               DEALER (READY/HB/REP)        +-----------^-----------+
+          |                   +-----|------------------+  +------------------|-----+
+          +--REQ (si GT1 cae)->| VM4: GT relevo :6555/6556 |  VM5: RMC "vm5"   |     |
+                              |      RMC "vm4" (2 hilos)--+---REQ------------+-----+
+                              +---------------------------+  (2 hilos)
+
+  Las capas del enunciado: consumidores (VM1), lógica de negocio (VM2, VM4, VM5), almacenamiento (VM3).
+  Mínimo del enunciado (3 máquinas): VM1, VM2 (GT + RMC + cancelaciones) y VM3: es la arquitectura base.
+
+Componentes y puertos
+  GT principal      VM2  5555 clientes (ROUTER) / 5556 RMC (ROUTER) / PUSH a cancelaciones
+  GT de relevo      VM4  6555 / 6556  (mismo binario, otros puertos)
+  Cancelaciones     VM2  5557 PULL / 5558 PUB (notificaciones)
+  Persistencia      VM3  5559
+  RMC               VM4 y VM5, 2 hilos cada una (4 trabajadores)
+
+
+3. PATRONES DE COMUNICACIÓN (ZeroMQ)
+------------------------------------
+  Cliente -> GT          REQ/ROUTER. Cliente con "Lazy Pirate": timeout (4 s), hasta 3 reintentos con el MISMO
+                         idMensaje, rota entre los GT de su lista (principal, relevo) y reabre el socket.
+  GT <-> RMC             ROUTER (GT) / DEALER (RMC) con "Paranoid Pirate": el RMC se registra con READY, ambos
+                         lados se envían HEARTBEAT (500 ms), el GT mantiene la lista de trabajadores LIBRES por
+                         orden LRU y manda cada solicitud al libre que lleva más tiempo sin trabajar.
+  RMC -> Persistencia    REQ -> ROUTER/DEALER (broker interno) -> N hilos REP (patrón "multithreaded server").
+  Cancelación            Cliente -> GT por REQ/REP con ACK inmediato (no bloquea); GT -> Cancelaciones por
+                         PUSH/PULL (pipeline); Cancelaciones -> Persistencia por REQ/REP; notificación por PUB/SUB.
+  Notificación           PUB/SUB con tópico "c<idCliente>|": cada cliente solo recibe las suyas.
+
+
+4. ESCALABILIDAD (estrategias vistas en clase aplicadas)
+--------------------------------------------------------
+  - Replicación del servicio RMC (varios procesos, varias VMs, varios hilos). Es "sin estado": todo el estado
+    está en la BD, por eso cualquier réplica puede atender cualquier solicitud.
+  - Balanceo de carga en el GT (LRU sobre trabajadores libres). Reparto equitativo VM4/VM5: el GT imprime
+    "reparto entre VMs: vm4=609 (51.4%) vm5=575 (48.6%)". La VM de un trabajador sale del prefijo de su
+    identidad "<--nombre>/h<hilo>#<pid>".
+  - Concurrencia en la capa de datos: pool de hilos en Persistencia, una conexión PostgreSQL por hilo,
+    transacciones cortas con bloqueos filas en orden fijo (reserva antes que evento, ocurrencias en orden
+    ascendente) para evitar interbloqueos; con reintento automático si PostgreSQL aborta una transacción.
+  - Generador de carga distribuido (varias VMs) para que el cliente no sea el cuello de botella.
+  - Replicación de la BD (réplica de lectura): NO implementada; en su lugar se escala con hilos y conexiones.
+    (Cambie el texto del informe si prometía réplica de la BD.)
+
+  Consistencia (sin sobreventa): el descuento de asientos es "UPDATE ... SET libres = libres - n WHERE libres >= n"
+  más restricciones CHECK (libres >= 0, ocupados >= 0); nunca se lee y luego se escribe sin protección.
+
+
+5. TOLERANCIA A FALLAS
+----------------------
+Modelo de fallas considerado: caída de procesos o de una VM (crash), pérdida o retraso de mensajes, procesos
+lentos. No se consideran fallas bizantinas.
+
+  Falla                      Detección                          Recuperación (transparente para el cliente)
+  -------------------------  ---------------------------------  ------------------------------------------------
+  Cae un RMC (proceso o VM)  GT: sin heartbeat 500 ms x 4       GT reasigna la solicitud en curso a otro RMC; el
+                                                                supervisor arranca un RMC nuevo que se registra
+                                                                solo (READY). La VM sana absorbe la carga.
+  Cae el GT principal        Cliente: timeout (4 s)             Cliente reintenta con el mismo idMensaje en el GT
+                                                                de relevo (los RMC ya estaban registrados allí).
+  RMC pierde al GT           RMC: sin heartbeat del GT          RMC reabre el socket y reenvía READY (GT reiniciado
+                                                                o relevo recuperado).
+  Se pierde un mensaje       Timeout del cliente                Reintento con el mismo idMensaje. La BD detecta
+                                                                el duplicado y devuelve el resultado guardado.
+  Solicitud abandonada       GT: TTL 15 s en cola, 60 s en curso  Se descarta y se cuenta (expiradas); el cliente ya
+                                                                habrá reintentado.
+  Mensaje mal formado        Validación en el GT                Se responde ERROR y se cuenta como inválida.
+
+  "Las operaciones continúan en el punto en que se habían dejado": la solicitud que estaba en vuelo no se
+  reinicia desde el principio en el cliente: la reasigna el GT o la reintenta el cliente, y la tabla
+  "transaccion" garantiza que si la primera ejecución sí llegó a la BD no se repite (idempotencia). Una
+  reserva nunca se pierde ni se duplica: se comprueba en las pruebas contando filas de la BD.
+
+  Limitaciones (decirlas en la sustentación): una sola instancia de PostgreSQL/Persistencia y de Cancelaciones;
+  una cancelación aceptada que aún no pasó del GT a Cancelaciones se pierde si el proceso GT muere justo ahí.
+
+
+6. CONCURRENCIA E IDEMPOTENCIA EN LA BD
+---------------------------------------
+Tablas: evento (id_evento, id_ocurrencia, num_ocurrencias, fecha, asientos_libres, asientos_ocupados),
+reserva (id_reserva, id_cliente, id_evento, id_ocurrencia, num_asientos, activa), transaccion (id_cliente,
+id_mensaje, tipo, resultado, id_reserva, ...). Toda operación que modifica empieza con
+"INSERT INTO transaccion ... ON CONFLICT DO NOTHING": si no inserta es un duplicado y se devuelve lo guardado.
+
+Chequeo previo idempotente (error encontrado y corregido durante las pruebas de falla del RMC):
+el RMC consulta la disponibilidad ANTES de reservar/modificar (paso 2 del enunciado). Si el GT reasigna una
+solicitud, o el cliente la reintenta, el primer intento pudo haber guardado la reserva y consumido los últimos
+asientos; el segundo intento veía "sin cupo" y respondía RECHAZO sin llegar a la tabla de idempotencia: la
+reserva existía en la BD pero el cliente creía que había fallado (3027 filas contra 3026 confirmadas). Ahora la
+consulta de disponibilidad lleva el idMensaje de la operación: si Persistencia ya la ejecutó, devuelve el
+resultado guardado (con el tipo original) y el RMC lo reenvía sin decidir nada con la disponibilidad actual. Las
+dos lecturas (transaccion y evento) usan la misma foto de la BD (REPEATABLE READ) para que no haya una ventana en
+la que la operación aparezca confirmada en una lectura y no en la otra. La prueba de regresión está en
+tests/prueba_funcional.cpp (reintento de la reserva que agotó E50) y en la prueba 5 de la batería (caída del RMC
+con asientos escasos; 6 repeticiones seguidas sin diferencias entre confirmadas y filas de la BD).
+
+
+7. PROTOCOLO DE PRUEBAS (lo que pide el informe: todos los tipos de prueba)
+---------------------------------------------------------------------------
+Se ejecutan con: make && scripts/pruebas_automaticas.sh 15
+Resultado en la máquina de desarrollo: ver "RESULTADO DE LA BATERÍA" al final de este archivo.
+
+  # Tipo                  Qué se prueba                                      Herramienta        Criterio de éxito
+  1 Unitarias             Serialización de mensajes: ida y vuelta (64 bits),  tests/test_mensaje  18/18
+                          separadores, 13/15 campos, números inválidos,       (C++)
+                          tipo/resultado inexistente.
+  2 Funcional / sistema   Consulta, reserva, idempotencia (mismo idMensaje),  tests/prueba_      42/42 y la BD final
+                          modificar asientos y fecha, rechazos, cancelación   funcional + SQL    coincide con lo esperado
+                          asíncrona con notificación, mensajes mal formados.
+  3 Caso del profesor     Estado de la BD antes y después de un conjunto de   bin/cliente +      BD final = esperada
+                          operaciones dado (archivo de texto).                psql
+  4 Integración           Todo el flujo cliente -> GT -> RMC -> Persistencia  (incluido en 2 y 3)
+                          -> BD y Cancelaciones -> PUB/SUB.
+  5 Concurrencia          8 clientes sin pausa compitiendo por 120 asientos:  generador + SQL    0 asientos negativos;
+                          no hay sobreventa ni asientos "perdidos".                              libres+ocupados constante;
+                                                                                                 ocupados = suma de reservas
+                                                                                                 activas; confirmadas = filas
+  6 Reparto de carga      Las 2 VMs de RMC reciben la misma cantidad de       estadísticas GT    diferencia <= 5%
+                          solicitudes.
+  7 Tolerancia a fallas   (a) kill -9 de una VM de RMC en plena carga (con    kill -9 +          errores=0, sin respuesta=0,
+                          asientos escasos); (b) kill -9 del GT principal     generador + SQL    confirmadas = filas BD, y el
+                          (cliente pasa al relevo); (c) supervisor relanza                       GT registra la caída/reasignación
+                          el RMC caído.
+  8 Generador distribuido Mismo comando en 2 VMs: 4+4 clientes, ids únicos,   generador          4+4; ids distintos; CSV por VM
+                          un CSV de muestras por VM.
+  9 Seguridad/robustez    Mensajes mal formados, números fuera de rango,      (en 1 y 2)         Responde ERROR, no se cae nada
+                          mes inválido, evento inexistente.
+ 10 Rendimiento           Tabla 1 (sección 8).                                tabla1.sh +        Informe
+                                                                             analisis.py
+ 11 Regresión             Repetir toda la batería tras cada cambio.            la misma batería   Todo PASS
+
+Invariantes de la BD comprobados tras CADA prueba de carga:
+  (i) ninguna ocurrencia con asientos negativos; (ii) suma(libres+ocupados) igual a la inicial;
+  (iii) ocupados de cada ocurrencia = suma de las reservas activas de esa ocurrencia.
+
+
+8. PRUEBAS DE RENDIMIENTO (Tabla 1) - PROTOCOLO
+-----------------------------------------------
+Escenarios (enunciado):
+  3 clientes: 2 solo consulta + 1 consulta/reserva     (perfil: 50% consulta / 50% reserva)
+  5 clientes: 3 solo consulta + 2 reserva/modificación (perfil: 70% reserva / 30% modificación)
+  8 clientes: 4 solo consulta + 4 reserva/modificación (igual perfil)
+Arquitecturas:
+  Base       GT + 1 RMC de 1 hilo + Persistencia con --hilos 1 (sin relevo, 3 VMs)
+  Escalable  GT + relevo, RMC 2 VMs x 2 hilos, Persistencia --hilos 4, generador repartido en 2 VMs
+Procedimiento por corrida (lo automatiza scripts/tabla1.sh):
+  1. Restablecer la BD (kill -USR2 a la persistencia) y poner contadores del GT en cero (kill -USR1).
+  2. Correr el generador: 15 s de calentamiento (se descartan) + 120 s medidos = ~2.3 min por corrida.
+     Carga sin pausa (--rpm 0, cada cliente pide al recibir la respuesta anterior). Si el profesor prefiere
+     una carga moderada, repetir con --rpm 60 (el enunciado exige >= 20 solicitudes/min por cliente).
+  3. Repetir 3 veces cada escenario; reportar el promedio de las 3 y la dispersión entre corridas.
+  4. Persistencia con --asientos 5000 para que los asientos no se agoten durante la carga (si se agotan, las
+     reservas se rechazan rápido y distorsionan los tiempos). Servicios con --silencioso (sin E/S de logs).
+Métricas (las 4 de la Tabla 1, por escenario y arquitectura):
+  1) Tiempo promedio de respuesta y desviación estándar de CONSULTA.
+  2) Ídem de RESERVA.
+  3) TPM de consulta.   4) TPM de reserva.
+  Además p95 (objetivo cuantitativo: p95 < 1 s) y errores/timeouts.
+Cómo se miden:
+  - Tiempos: reloj del cliente (monotónico) entre enviar y recibir la respuesta, por solicitud
+    (analisis/analisis.py los agrega desde los CSV de muestras de todas las VMs generadoras).
+  - TPM: transacciones procesadas / minutos de la ventana medida, contando respuestas recibidas (EXITO o
+    RECHAZO de negocio). Comprobación cruzada: el GT imprime su propio TPM por tipo (GT-STATS, y CSV con
+    --stats-csv): ambos deben coincidir de forma aproximada. El enunciado admite medir TPM "en el GT o la BD".
+  - Uso de recursos: 'vmstat 5' o 'top -b -d 5' en cada VM durante las corridas (guardar la salida).
+Herramientas: bin/generador (carga parametrizable), scripts/tabla1.sh, GT-STATS, psql, vmstat/top,
+              analisis/analisis.py (Python 3, pandas, matplotlib).
+Salidas: resultados/tabla1.csv|md, tiempo_promedio.png, tiempo_p95.png, tpm.png, por_corrida.csv.
+Hardware y software a reportar (comandos para llenarlo en CADA VM):
+  lscpu | grep -E "Model name|^CPU\(s\)"; free -h; uname -a; lsb_release -d; g++ --version | head -1;
+  psql --version; pkg-config --modversion libzmq libpqxx; (red entre VMs: ping -c 5 IP_BD).
+  (En la máquina de desarrollo donde se probó: 2 CPU Intel Xeon 2.1 GHz, 7.8 GB, Ubuntu 24.04, g++ 13.3,
+   PostgreSQL 16, libzmq 4.3.5, libpqxx 7.8.1. Las VMs del curso usan libpqxx 6.4 y PostgreSQL 14.)
+
+Qué esperar y cómo analizarlo (análisis para el informe, SIN inventar números):
+  - Con 3 clientes el sistema base no está saturado: la mejora de la escalable será pequeña (la latencia está
+    dominada por la red y la BD). Con 5 y 8 clientes la cola en el único RMC del sistema base crece y su
+    tiempo promedio y p95 suben; la escalable (4 trabajadores en 2 VMs + 4 hilos de BD) debería mantenerlos
+    más planos y dar más TPM. Cuánto mejoran lo dirán SUS medidas: expresen la mejora como (base-escalable)/base
+    para tiempos y (escalable-base)/base para TPM.
+  - Si la mejora es pequeña, el cuello de botella probablemente es PostgreSQL (una sola instancia): lo
+    confirman con 'top' en VM3. Es una conclusión válida y consistente con la limitación declarada.
+  - Reportar también la desviación estándar entre repeticiones (tpm_std_entre_corridas en por_escenario.csv).
+
+
+9. QUÉ ACTUALIZAR EN EL INFORME Y EN LOS DIAGRAMAS
+--------------------------------------------------
+  - Lenguaje: C++17 (no C). Librerías: ZeroMQ + cppzmq, libpqxx/libpq (PostgreSQL), pthreads/std::thread.
+    Medición del tiempo con std::chrono (reloj monotónico), no "clock_gettime".
+  - El "broker" de ROUTER/DEALER es el propio GT (no hay un proceso broker aparte): no es un punto de fallo extra.
+  - La Persistencia es multihilo (ROUTER/DEALER interno + hilos REP + pool de conexiones). No hay réplica de
+    BD: si el informe la menciona, quítenla o dígala como trabajo futuro.
+  - No hay activación por umbrales de carga: las 2 VMs de RMC están siempre activas.
+  - Diagramas a rehacer: despliegue (5 VMs, sección 2), componentes (GT con 2 ROUTER, RMC con DEALER, hilos de
+    Persistencia, GT de relevo), clases (Mensaje con idMensaje 64 bits; EnlaceGT; clases de servicio; Metricas;
+    tabla transaccion) y secuencia (reserva normal; reserva con caída del RMC y reasignación; reserva con
+    caída del GT y reintento; cancelación asíncrona).
+  - Límite de 5 páginas del informe de rendimiento: tablas + 3 gráficos + análisis; el diseño va en el video.
+
+
+10. VIDEO (7 min máx.): GUION SUGERIDO
+--------------------------------------
+  0:00 Distribución de componentes en máquinas (diagrama de la sección 2).            1 min
+  1:00 Lenguaje, herramientas y librerías; patrones por canal (tabla de la sección 3).  1.5 min
+  2:30 Componentes escalables (LRU, hilos, BD multihilo) y tolerantes a fallas
+       (heartbeats, reasignación, relevo, Lazy Pirate, idempotencia, supervisor).        2.5 min
+  5:00 Generación de carga (parámetros, perfiles, reparto en 2 VMs, CSV, análisis).      1.5 min
+  6:30 Cierre y limitaciones.                                                           0.5 min
+  (El video NO muestra la corrida, solo explica.)
+
+
+11. CUELLO DE BOTELLA, APORTE DE VM4/VM5 Y PATRONES DE RESILIENCIA ADICIONALES
+------------------------------------------------------------------------------
+Medición preliminar (UNA sola máquina de 2 núcleos, red loopback; sirve para las PROPORCIONES entre componentes,
+no para valores absolutos). Se repite en las VMs con scripts/prueba_empirica.sh (CPU por componente y por nodo).
+CPU por transacción, arquitectura escalable, 4 clientes sin pausa, 20 s:
+                      GT      RMC     Persistencia   PostgreSQL   TOTAL
+  Consulta           0.10    0.11        0.14          0.15       0.50 ms
+  Reserva            0.08    0.13        0.27          0.62       1.10 ms     (PostgreSQL + persistencia = 81%)
+- Lo que más cuesta es la capa de datos, y dentro de ella la reserva (transacción de escritura, ~2.2 veces una consulta).
+  GT y RMC son baratos (<25% del total).
+- Entonces las réplicas RMC no ayudan quitando CPU, sino aumentando la CONCURRENCIA: cada solicitud ocupa un trabajador
+  RMC mientras espera a la BD, y el máximo de solicitudes en vuelo es el número de trabajadores RMC (ley de Little:
+  throughput = solicitudes en vuelo / tiempo de respuesta). En la arquitectura base hay 1 en vuelo: con 8 clientes el
+  sistema usó solo 49% de la CPU (la persistencia y PostgreSQL esperaban) y el tiempo promedio fue 9.7 ms. Con 4 trabajadores
+  en 2 VMs: ~2.2 veces más operaciones por segundo y 3.6-5.5 ms. En la corrida "elástica" (VM4 y VM5 se unen en plena carga)
+  el throughput pasó de ~800 a ~1930 ops/s.
+- El límite se desplaza a PostgreSQL: cuando VM3 se acerque al 100% de CPU o de disco (iowait), más RMC ya no mejora y la
+  única salida es la BD (réplicas, particionado, ajustes). Es la limitación declarada en la sección 5.
+
+Patrones adicionales evaluados (NO implementados):
+- Leaky bucket (admisión a ritmo constante): no ayuda en la Tabla 1, porque con <= 8 clientes que esperan su respuesta la carga
+  ya está acotada y el cubo solo añadiría espera. Tiene sentido con muchos clientes o ráfagas. Lo que hoy falta en el GT es una
+  cola ACOTADA con rechazo inmediato ("sistema ocupado"): hoy la cola solo caduca a los 15 s. Eso (load shedding / contrapresión)
+  es más adecuado que un ritmo fijo porque la capacidad real varía con la BD.
+- Circuit breaker: más relevante. Si Persistencia/PostgreSQL cae, cada trabajador RMC se bloquea 3 s por solicitud, la cola del
+  GT crece y los clientes reintentan (tormenta de reintentos; sin duplicados gracias a la idempotencia, pero con latencias
+  enormes). Un breaker en el RMC (cerrado -> abierto tras N timeouts seguidos, responde ERROR al instante durante T segundos,
+  semiabierto con una sonda) falla rápido y recupera sin esperar. No elimina el punto único de falla de la BD.
+  El enunciado exige tolerar fallas del GT y del RMC, no de la BD, así que son mejoras opcionales.
+
+RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarrollo)
+------------------------------------------------------------------------------
+== 1. Pruebas unitarias del mensaje ==
+  [PASS] 18 pruebas, 0 fallos
+== 2. Prueba funcional (reservas, modificaciones, cancelaciones, idempotencia, mensajes inválidos) ==
+  [PASS] 42 pruebas, 0 fallos
+  [PASS] estado final de la BD = esperado [ocupados=117 libres=6883 reservas_activas=4 reservas_total=5]
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 3. Concurrencia: 8 clientes compitiendo por 120 asientos (sin pausa, 15s) ==
+    [02:56:58.821] [CARGA] RESERVA:  n=9059 prom=4.53 ms std=2.40 p95=9.22 TPM=36236.0 rechazos=6888 timeouts=0
+    [02:56:58.821] [CARGA] MODIFIC.: n=6263 prom=4.98 ms std=2.60 p95=9.76 TPM=25052.0 rechazos=2898 timeouts=0
+    [02:56:58.821] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=2171 reservas_sin_respuesta=0
+    [02:56:58.821] [CARGA] cancelaciones enviadas=2120 notificaciones recibidas=2120
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 120 (no se perdieron ni crearon asientos) [120]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+  [PASS] ninguna respuesta de error [errores=0]
+  [PASS] ninguna solicitud sin respuesta [0]
+  [PASS] reservas confirmadas a los clientes = filas en la tabla reserva [2171 = 2171]
+== 4. Reparto equitativo entre las 2 VMs de RMC (carga normal, 15s) ==
+    [02:57:18.735] [CARGA] CONSULTA: n=729 prom=4.17 ms std=1.87 p95=7.17 TPM=3364.6 timeouts=0
+    [02:57:18.735] [CARGA] RESERVA:  n=207 prom=7.01 ms std=2.09 p95=10.01 TPM=955.4 rechazos=0 timeouts=0
+    [02:57:18.735] [CARGA] MODIFIC.: n=104 prom=6.66 ms std=1.76 p95=9.92 TPM=480.0 rechazos=0 timeouts=0
+    [02:57:18.735] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=236 reservas_sin_respuesta=0
+    [02:57:18.735] [CARGA] fila agregada a logs/pruebas/reparto.csv
+    [02:57:18.737] [GT-STATS] reparto entre VMs: vm4=598 (50.5%)  vm5=586 (49.5%)  
+  [PASS] reparto equitativo: vm4=598 vm5=586 (diferencia 1% <= 5%)
+  [PASS] sin errores [0]
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 5. Falla de una VM de RMC en plena carga, con asientos escasos (se apaga vm4 con kill -9 a los 6 s) ==
+    [02:57:39.271] [CARGA] CONSULTA: n=24121 prom=2.85 ms std=13.25 p95=4.34 TPM=96484.0 timeouts=0
+    [02:57:39.271] [CARGA] RESERVA:  n=9558 prom=2.97 ms std=1.39 p95=4.68 TPM=38232.0 rechazos=9439 timeouts=0
+    [02:57:39.272] [CARGA] MODIFIC.: n=5820 prom=3.49 ms std=26.89 p95=4.98 TPM=23280.0 rechazos=4721 timeouts=0
+    [02:57:39.272] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=119 reservas_sin_respuesta=0
+    [02:57:32.110] [GT1] RMC vm4/h1#4386 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
+    [02:57:32.110] [GT1] RMC vm4/h0#4386 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
+    [02:57:39.274] [GT-STATS] inválidas=0 reasignadas=2 expiradas=0
+  [PASS] el GT detectó la caída de las 2 réplicas de vm4 por falta de heartbeat [2]
+  [PASS] la falla fue transparente: ningún error para los clientes [errores=0]
+  [PASS] ninguna reserva quedó sin respuesta [0]
+  [PASS] ninguna reserva perdida ni duplicada: confirmadas = filas [119 = 119]
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 120 (no se perdieron ni crearon asientos) [120]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 6. Falla del GT principal en plena carga (kill -9 a los 6 s; los clientes pasan al GT de relevo) ==
+    [02:58:07.845] [CARGA] CONSULTA: n=30881 prom=3.82 ms std=22.82 p95=5.67 TPM=80559.1 timeouts=0
+    [02:58:07.846] [CARGA] RESERVA:  n=8057 prom=5.22 ms std=38.62 p95=8.02 TPM=21018.3 rechazos=4772 timeouts=0
+    [02:58:07.846] [CARGA] MODIFIC.: n=3988 prom=5.26 ms std=31.80 p95=8.44 TPM=10403.5 rechazos=1172 timeouts=0
+    [02:58:07.846] [CARGA] errores=0 reintentos=8 cambios_de_GT=8 reservas_confirmadas=3285 reservas_sin_respuesta=0
+  [PASS] los clientes pasaron al GT de relevo [cambios_de_GT=8]
+  [PASS] ningún error para los clientes [errores=0]
+  [PASS] ninguna reserva quedó sin respuesta [0]
+  [PASS] los reintentos no duplicaron ni perdieron reservas: confirmadas = filas [3285 = 3285]
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 7. Generador repartido en 2 VMs (mismo comando, --vm-indice 0 y 1) ==
+    [02:58:12.549] [CARGA] VM 0/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
+    [02:58:12.549] [CARGA] VM 1/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
+  [PASS] 8 clientes repartidos 4 + 4 entre las 2 VMs [4 + 4]
+  [PASS] los 4 clientes que reservan (2 por VM) tienen ids distintos entre VMs [4]
+  [PASS] cada VM generadora escribe su propio CSV de muestras (vm_indice 0 1 )
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 8. Cliente de archivo: caso de ejemplo del profesor (BD antes y después) ==
+  [PASS] BD inicial: 50 eventos, 20 con 2 ocurrencias, 100 asientos cada una [ocupados=0 libres=7000]
+  [PASS] BD final = la esperada para el caso [ocupados=12 libres=6988]
+  [PASS] reservas activas = 1:E1/o1x3 2:E2/o2x5 3:E30/o1x4 [1:E1/o1x3 2:E2/o2x5 3:E30/o1x4]
+  [PASS] la cancelación asíncrona terminó con su notificación al cliente
+  [PASS] cambiar fecha de un evento de una sola ocurrencia se rechaza
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 9. Supervisor: un proceso nuevo sustituye al RMC que cae (kill -9 a los 5 s) ==
+    [02:58:55.517] [CARGA] RESERVA:  n=5893 prom=4.24 ms std=1.68 p95=7.07 TPM=23572.0 rechazos=2794 timeouts=0
+    [02:58:55.518] [CARGA] MODIFIC.: n=2935 prom=4.46 ms std=1.68 p95=7.41 TPM=11740.0 rechazos=655 timeouts=0
+    [02:58:55.518] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=3099 reservas_sin_respuesta=0
+    [SUPERVISOR 02:58:45] bin/rmc terminó con código 137; arranco un proceso nuevo (reinicio #1)
+  [PASS] el supervisor arrancó un proceso nuevo tras la caída
+  [PASS] el GT registró de nuevo las réplicas de vm4 (2 al inicio + 2 del proceso nuevo) [4]
+  [PASS] falla transparente: errores=0, sin respuesta=0
+  [PASS] confirmadas = filas de la BD [3099 = 3099]
+  [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
+  [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
+  [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+
+RESUMEN: 52 pruebas correctas, 0 fallidas   (logs en logs/pruebas/)
+
+(Corrida del 17-nov-2026, 1 máquina de 2 CPU. Las cifras de tiempo/TPM de arriba NO son las del informe.)
+
