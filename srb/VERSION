@@ -1,1 +1,1 @@
-SRB v3.2 (2026-11-18): + escalado por CPU (scale-out/scale-in) y leaky bucket; prueba escalamiento; procedimientos
+SRB v3.4 (2026-11-18): test1/test2 con veredicto automático; carga sintética del RMC (--carga-cpu-ms); monitores monitor_vm.sh y monitor_bd.sh; contador de solicitudes en tiempo real en VM1 (--en-vivo); README, ARQUITECTURA_FINAL y CAMBIOS

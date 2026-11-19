@@ -26,12 +26,12 @@ escucha() { echo " $PUERTOS " | grep -q " $1 "; }
 PG=0; pgrep -x postgres >/dev/null 2>&1 && PG=1
 
 roles=()
-{ [ "$PG" = 1 ] || tiene persistencia; } && roles+=("ALMACENAMIENTO (VM3: PostgreSQL + persistencia)")
+{ [ "$PG" = 1 ] || tiene persistencia; } && roles+=("ALMACENAMIENTO (VM2: PostgreSQL + persistencia)")
 if tiene gestor; then
     if echo "$PROCS" | grep -q -- "GT2\|6555"; then roles+=("GT DE RELEVO (puertos 6555/6556)")
-    else roles+=("GT PRINCIPAL (VM2: entrada del negocio)"); fi
+    else roles+=("GT PRINCIPAL (VM3: entrada del negocio)"); fi
 fi
-tiene cancelaciones && roles+=("CANCELACIONES (VM2)")
+tiene cancelaciones && roles+=("CANCELACIONES (VM3)")
 for n in $(echo "$PROCS" | grep "bin/rmc" | grep -o -- "--nombre [^ ]*" | awk '{print $2}' | sort -u); do
     roles+=("RMC réplica '$n'")
 done
@@ -43,7 +43,7 @@ if [ "${#roles[@]}" -gt 0 ]; then ROL=$(printf '%s + ' "${roles[@]}"); ROL=${ROL
 elif [ -f "$RUTA_ROL" ]; then ROL="$(cat "$RUTA_ROL") (anotado con --fijar; no hay procesos del SRB corriendo)"
 else
     ROL="sin procesos del SRB corriendo: no se puede deducir"
-    if command -v psql >/dev/null 2>&1 && [ -d /var/lib/postgresql ]; then ROL="$ROL; tiene PostgreSQL instalado -> probablemente VM3"; fi
+    if command -v psql >/dev/null 2>&1 && [ -d /var/lib/postgresql ]; then ROL="$ROL; tiene PostgreSQL instalado -> probablemente VM2 (la BD)"; fi
 fi
 
 if [ "$CORTO" = 1 ]; then
@@ -75,6 +75,6 @@ done
 echo "--- Binarios compilados (en ${BIN:-ninguna carpeta bin/ del proyecto encontrada}) ---"
 [ -n "$BIN" ] && ls "$BIN" | grep -E '^(persistencia|gestor|rmc|cancelaciones|generador|cliente)$' | tr '\n' ' '; echo
 echo
-echo "Papel de cada VM:  VM1 consumidores · VM2 GT principal + cancelaciones · VM3 PostgreSQL + persistencia"
-echo "                   VM4 RMC 'vm4' + GT de relevo · VM5 RMC 'vm5'"
+echo "Papel de cada VM:  VM1 consumidores y control · VM2 PostgreSQL + persistencia · VM3 GT + cancelaciones + RMC 'base'"
+echo "                   VM4 RMC 'vm4' (+ GT de relevo en la variante escalable) · VM5 RMC 'vm5'"
 echo "Si esta máquina aún no corre nada y no sabe cuál es: anótelo con  scripts/quien_soy.sh --fijar VM4"

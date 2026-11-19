@@ -8,15 +8,41 @@
 //
 // Uso: ./rmc --gt tcp://IP_GT:5556[,tcp://IP_GT_RELEVO:5556] --persistencia tcp://IP_BD:5559
 //            [--hilos 2] [--nombre vm4] [--hb-ms 500] [--liveness 4] [--timeout-ms 3000]
-//            [--cpu-simulada archivo] [--silencioso]
+//            [--cpu-simulada archivo] [--carga-cpu-ms N] [--silencioso]
 // Cada READY/heartbeat lleva la CPU del nodo (% de todos sus núcleos): el GT la usa para decidir cuándo
 // activar la siguiente VM (scale-out) y cuándo liberarla (scale-in). --cpu-simulada lee ese valor de un
 // archivo (para ensayar el escalado sin generar carga real).
+// --carga-cpu-ms N: cada solicitud consume además N ms de CPU (un bucle de cálculo, no una espera) antes de ejecutarse.
+// Es una CARGA SINTÉTICA para pruebas de estrés: simula una lógica de negocio costosa (validaciones, precios, reglas)
+// y permite que la capa lógica (VM3/VM4/VM5) se sature antes que la BD, que es lo que hace visible el escalado. Por
+// defecto vale 0 (sin carga extra) y el comportamiento es el de siempre.
+#include <ctime>
 #include <thread>
 
 #include "common.hpp"
 
 using namespace srb;
+
+// Consume `ms` milisegundos de CPU del hilo actual (tiempo de CPU, no de reloj: si la VM está saturada y el hilo
+// espera turno, el trabajo sigue costando `ms` de CPU y la solicitud tarda más, como en una lógica real).
+static void quemarCpu(double ms) {
+    if (ms <= 0) return;
+    timespec t0;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
+    volatile unsigned long long x = 88172645463325252ULL;
+    for (;;) {
+        for (int i = 0; i < 2000; ++i) {
+            unsigned long long v = x;
+            v ^= v << 13;
+            v ^= v >> 7;
+            v ^= v << 17;
+            x = v;
+        }
+        timespec t;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000.0 + (t.tv_nsec - t0.tv_nsec) / 1e6 >= ms) break;
+    }
+}
 
 struct ConfigRMC {
     std::vector<std::string> gts;
@@ -27,6 +53,7 @@ struct ConfigRMC {
     int liveness = 4;
     int timeoutMs = 3000;
     std::string cpuSimulada;
+    double cargaCpuMs = 0.0;  // CPU sintética por solicitud (ms); 0 = ninguna
 };
 
 class ServicioRMC {
@@ -183,6 +210,7 @@ private:
             r.resultado = Estado::ERROR;
             logLinea(tag, "mensaje mal formado -> ERROR");
         } else {
+            quemarCpu(cfg_.cargaCpuMs);
             switch (m.tipo) {
                 case TipoOperacion::CONSULTA: r = atenderConsulta(m); break;
                 case TipoOperacion::RESERVA: r = atenderReserva(m); break;
@@ -218,6 +246,7 @@ int main(int argc, char** argv) {
     c.liveness = argInt(argc, argv, "--liveness", c.liveness);
     c.timeoutMs = argInt(argc, argv, "--timeout-ms", c.timeoutMs);
     c.cpuSimulada = argStr(argc, argv, "--cpu-simulada", "");
+    c.cargaCpuMs = argDbl(argc, argv, "--carga-cpu-ms", 0.0);
     try {
         zmq::context_t ctx(1);
         MedidorCPU cpu(c.cpuSimulada);

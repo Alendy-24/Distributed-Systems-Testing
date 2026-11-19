@@ -21,7 +21,12 @@ instantanea() {
         esac
     done | awk '{a[$1]+=$2} END{for(k in a) print k, a[k]}' | sort
 }
-cpu_global() { awk '/^cpu /{busy=$2+$3+$4+$7+$8+$9; tot=busy+$5+$6; print busy, tot, $6}' /proc/stat; }
+# aritmética entera en bash: los contadores de /proc/stat pasan de 2^31 y algunos awk los imprimen con 6 cifras
+cpu_global() {
+    local x u n s i w irq sirq st
+    read -r x u n s i w irq sirq st _ < /proc/stat
+    echo "$((u + n + s + irq + sirq + st)) $((u + n + s + irq + sirq + st + i + w)) $w"
+}
 
 sleep "$ESPERA"
 instantanea > /tmp/.srb_muestreo_a.$$
@@ -32,6 +37,10 @@ read -r b1 t1 w1 < <(cpu_global)
 
 join -a1 -a2 -e 0 -o 0,1.2,2.2 /tmp/.srb_muestreo_a.$$ /tmp/.srb_muestreo_b.$$ | \
     awk -v clk="$CLK" -v v="$VENTANA" -v n="$NODO" '{d=($3>$2)?$3-$2:0; s=d/clk; printf "MUESTREO %s %s %.2f %.0f\n", n, $1, s, 100*s/v}'
-awk -v b0="$b0" -v t0="$t0" -v w0="$w0" -v b1="$b1" -v t1="$t1" -v w1="$w1" -v n="$NODO" -v c="$NPROC" \
-    'BEGIN{dt=t1-t0; if(dt<=0)dt=1; printf "NODO %s %.0f %.0f %d\n", n, 100*(b1-b0)/dt, 100*(w1-w0)/dt, c}'
+db=$((b1 - b0)); dt=$((t1 - t0)); dw=$((w1 - w0))
+if [ "$dt" -gt 0 ] && [ "$db" -ge 0 ]; then
+    echo "NODO $NODO $(( (200 * db + dt) / (2 * dt) )) $(( (200 * dw + dt) / (2 * dt) )) $NPROC"
+else
+    echo "NODO $NODO nan nan $NPROC"
+fi
 rm -f /tmp/.srb_muestreo_a.$$ /tmp/.srb_muestreo_b.$$

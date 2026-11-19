@@ -12,6 +12,9 @@
 #   scripts/prueba_empirica.sh escalamiento             SCALE-OUT / SCALE-IN por CPU con rampa de carga: VM3 sirve sola
 #                                                        hasta el 50 % de CPU, luego se activa VM4, luego VM5; al
 #                                                        saturarse todas entra el leaky bucket; al bajar la carga se liberan
+#   scripts/prueba_empirica.sh test1                     UNA VM alcanza: carga ligera; comprueba que no hay scale-out ni cubeta
+#   scripts/prueba_empirica.sh test2                     rampa PESADA hasta ocupar las 3 VMs (scale-out a vm4 y vm5 + leaky
+#                                                        bucket); usa CPU sintética en el RMC (CARGA_T ms por solicitud)
 #   scripts/prueba_empirica.sh procedimientos base|escalable
 #                                                        aísla cada procedimiento (consulta, reserva, modificación,
 #                                                        cancelación, mixto) y dice cuánta CPU gasta cada componente
@@ -19,13 +22,20 @@
 #
 # Configuración: copie scripts/vms.conf.ejemplo a scripts/vms.conf y ponga las IP reales.
 # Requisitos: ssh sin contraseña desde esta VM hacia VM2, VM3, VM4 y VM5 (ver README), el proyecto compilado
-# (make) en la MISMA ruta en todas las VMs, y PostgreSQL con la base "srb" en VM3.
+# (make) en la MISMA ruta en todas las VMs, y PostgreSQL con la base "srb" en la VM de la BD (IP_BD).
 #
 # Variables opcionales: CLIENTES="3 5 8" REPS=1 DUR=60 CAL=10 HILOS_BD=4 HILOS_RMC=2 ASIENTOS=5000
 #                       ELASTICA_S=25 SALIDA=resultados_empiricos MODO=local (ensayo en una sola máquina)
 #                       CLIENTES_PROC=8 (clientes en 'procedimientos')  SALIDA_PROC=resultados_procedimientos
 #                       Escalamiento: PASOS="4 12 24 48 96 160 96 48 12 4" PASO_S=25 UMBRAL_OUT=50 UMBRAL_IN=20 CUBETA=60
 #                       FUGA=0 (req/s de salida de la cubeta; 0 = solo limita la cola) HILOS_ESC=4 ASIENTOS_ESC=200000
+#                       REPOSO_S=40 (segundos sin carga al final: se ve el scale-in)  METRICA=max|ultimo (CPU que decide el scale-out)
+#                       RPM_ESC=0 (solicitudes/min por cliente; 0 = sin pausa)  CARGA_MS=0 (CPU sintética por solicitud en el RMC)
+# Contador EN VIVO (solicitudes enviadas/respondidas/por segundo/en curso/rechazadas/fallas) en esta terminal mientras
+#   corre cada paso: EN_VIVO=1 (segundos entre líneas; 0 = apagado). Sale por stderr: con "| tee archivo" el archivo no
+#   lo guarda (use "2>&1 | tee" si lo quiere); la línea completa de cada paso queda siempre en el .gen.log de resultados.
+# test1 y test2 (scripts/test1.sh, scripts/test2.sh): ver más abajo y README. test1 = una VM alcanza; test2 = rampa hasta
+#   ocupar las 3 VMs. Variables: T1_PASOS T1_RPM T1_PASO_S  T2_PASOS T2_PASO_S T2_REPOSO_S CUBETA_T2  CARGA_T (ms de CPU por solicitud)  HILOS_T
 # Etiquetas de las VMs en los informes (vms.conf): ET_GT ET_BD ET_VM4 ET_VM5 ET_GEN, p. ej. ET_BD="VM2-BD".
 # Si la capa lógica está toda en UNA VM, ponga IP_VM4 e IP_VM5 iguales a IP_GT (y ET_VM4="" ET_VM5=""):
 # 'escalable' arranca entonces el GT de relevo y las réplicas RMC en esa misma VM.
@@ -45,8 +55,13 @@ ELASTICA_S=${ELASTICA_S:-25}
 CLIENTES_PROC=${CLIENTES_PROC:-8}
 PASOS=${PASOS:-"4 12 24 48 96 160 96 48 12 4"}; PASO_S=${PASO_S:-25}
 UMBRAL_OUT=${UMBRAL_OUT:-50}; UMBRAL_IN=${UMBRAL_IN:-20}; CUBETA=${CUBETA:-60}; FUGA=${FUGA:-0}
+REPOSO_S=${REPOSO_S:-40}; METRICA=${METRICA:-max}
+RPM_ESC=${RPM_ESC:-0}        # solicitudes por minuto de cada cliente en 'escalamiento' (0 = sin pausa, máxima carga)
+CARGA_MS=${CARGA_MS:-0}      # CPU sintética por solicitud en cada RMC (ms); 0 = ninguna. Ver --carga-cpu-ms de bin/rmc
+TITULO_ESC=${TITULO_ESC:-}; VEREDICTO_ESC=${VEREDICTO_ESC:-}
+EN_VIVO=${EN_VIVO:-1}        # segundos entre líneas del contador en vivo del generador (0 = apagado)
 HILOS_ESC=${HILOS_ESC:-4}; ASIENTOS_ESC=${ASIENTOS_ESC:-200000}
-ET_GT=${ET_GT-VM2(GT)}; ET_BD=${ET_BD-VM3(BD)}; ET_VM4=${ET_VM4-VM4}; ET_VM5=${ET_VM5-VM5}; ET_GEN=${ET_GEN-VM1(generador)}
+ET_GT=${ET_GT-VM3(GT)}; ET_BD=${ET_BD-VM2(BD)}; ET_VM4=${ET_VM4-VM4}; ET_VM5=${ET_VM5-VM5}; ET_GEN=${ET_GEN-VM1(generador)}
 SALIDA=${SALIDA:-resultados_empiricos}
 HOSTS=$(printf '%s\n' "$IP_GT" "$IP_BD" "$IP_VM4" "$IP_VM5" | awk '!v[$0]++')
 
@@ -71,6 +86,16 @@ en() {  # en <ip> <comando>: ejecuta en esa VM, dentro de la carpeta del proyect
 }
 lanzar() {  # lanzar <ip> <nombre_log> <comando>: arranca en segundo plano, sobrevive al cierre de ssh
     en "$1" "mkdir -p logs && (setsid nohup $3 > logs/$2.log 2>&1 < /dev/null &); sleep 0.2; true"
+}
+gen_vivo() {  # gen_vivo <log> <timeout_s> <args del generador...>: corre bin/generador; el detalle va al log y,
+              # si EN_VIVO>0, el contador "[EN VIVO]" de cada segundo se ve en esta terminal (stderr)
+    local log=$1 lim=$2; shift 2
+    if [ "${EN_VIVO:-0}" -gt 0 ] 2>/dev/null; then
+        timeout "$lim" bin/generador "$@" --en-vivo "$EN_VIVO" 2>&1 | tee "$log" |
+            grep --line-buffered '\[EN VIVO\]' | sed -u 's/^\[\([0-9:]*\)\.[0-9]*\] \[EN VIVO\]/   \1 EN VIVO/' >&2
+    else
+        timeout "$lim" bin/generador "$@" > "$log" 2>&1
+    fi
 }
 rol_de() {  # etiqueta (sin espacios) de los roles que tiene una IP según vms.conf
     local ip=$1 r=""
@@ -104,7 +129,7 @@ cmd_verificar() {
         for b in $(echo $necesarios | tr ' ' '\n' | sort -u); do
             en "$ip" "test -x bin/$b" 2>/dev/null || faltan="$faltan $b"
         done
-        [ -n "$faltan" ] && { echo "   AVISO: faltan binarios:$faltan (en esa VM: cd $(ruta_de "$ip") && make bin/${faltan# } -- ver 'Preparar VM4 y VM5' en el README)"; }
+        [ -n "$faltan" ] && { echo "   AVISO: faltan binarios:$faltan (en esa VM: cd $(ruta_de "$ip") && make$(for f in $faltan; do printf ' bin/%s' $f; done) -- ver 'Preparar VM4 y VM5' en el README)"; }
         en "$ip" "test -x scripts/muestreo_cpu.sh" 2>/dev/null || { echo "   ERROR: falta scripts/muestreo_cpu.sh (copie la carpeta scripts/)"; mal=1; }
         echo "   ok: $(en "$ip" 'hostname; nproc' | paste -sd' ') núcleos"
     done
@@ -154,10 +179,12 @@ arrancar() {  # arrancar <base|escalable|elastica>
     case $arq in
         escalamiento)   # niveles en orden de activación: base (VM3) -> vm4 -> vm5; el GT decide según la CPU de cada VM
             en "$IP_GT" "rm -f logs/escala.csv"
-            lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --escalar base,vm4,vm5 --umbral-out $UMBRAL_OUT --umbral-in $UMBRAL_IN --sostenido-out 3 --sostenido-in 10 --enfriar 8 --cubeta $CUBETA $( [ "$FUGA" != 0 ] && echo "--fuga $FUGA" ) --linea-tiempo logs/escala.csv --stats-csv logs/gt1.csv"
-            lanzar "$IP_GT" rmc_base "bin/rmc --silencioso --nombre base --hilos $HILOS_ESC --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
-            lanzar "$IP_VM4" rmc_vm4 "bin/rmc --silencioso --nombre vm4 --hilos $HILOS_ESC --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
-            lanzar "$IP_VM5" rmc_vm5 "bin/rmc --silencioso --nombre vm5 --hilos $HILOS_ESC --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
+            lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --escalar base,vm4,vm5 --umbral-out $UMBRAL_OUT --umbral-in $UMBRAL_IN --sostenido-out 3 --sostenido-in 10 --enfriar 8 --escala-metrica $METRICA --cubeta $CUBETA $( [ "$FUGA" != 0 ] && echo "--fuga $FUGA" ) --linea-tiempo logs/escala.csv --stats-csv logs/gt1.csv"
+            local carga="" prio=""
+            if [ "$CARGA_MS" != 0 ]; then carga="--carga-cpu-ms $CARGA_MS"; prio="nice -n 10 "; fi   # el GT pasa antes que el RMC de su VM
+            lanzar "$IP_GT" rmc_base "${prio}bin/rmc --silencioso --nombre base --hilos $HILOS_ESC $carga --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
+            lanzar "$IP_VM4" rmc_vm4 "bin/rmc --silencioso --nombre vm4 --hilos $HILOS_ESC $carga --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
+            lanzar "$IP_VM5" rmc_vm5 "bin/rmc --silencioso --nombre vm5 --hilos $HILOS_ESC $carga --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
             ESPERADOS=$((3 * HILOS_ESC)) ;;
         base)
             lanzar "$IP_GT" rmc_base "bin/rmc --silencioso --nombre base --hilos 1 --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
@@ -208,10 +235,9 @@ un_escenario() {  # un_escenario <arq> <clientes> <repeticion> [etiqueta_de_proc
         SAMPLERS+=($!)
     fi
     # shellcheck disable=SC2046
-    timeout $((CAL + DUR + 40)) bin/generador --clientes "$N" $(perfil "$N") --rpm 0 \
+    gen_vivo "$SALIDA/${etq}.gen.log" $((CAL + DUR + 40)) --clientes "$N" $(perfil "$N") --rpm 0 \
         --duracion $((CAL + DUR)) --calentamiento "$CAL" --gt "$gts" --notif "tcp://$IP_GT:5558" \
-        --arquitectura "$earq" --repeticion "$R" --muestras "$SALIDA/${etq}_muestras.csv" \
-        > "$SALIDA/${etq}.gen.log" 2>&1
+        --arquitectura "$earq" --repeticion "$R" --muestras "$SALIDA/${etq}_muestras.csv"
     wait "${SAMPLERS[@]}" 2>/dev/null
 
     # --- rendimiento visto por los clientes
@@ -224,14 +250,14 @@ un_escenario() {  # un_escenario <arq> <clientes> <repeticion> [etiqueta_de_proc
     echo "   CPU durante la ventana medida (${W}s):"
     printf '   %-22s %-14s %8s %14s\n' "Nodo" "Componente" "CPU (s)" "% de 1 núcleo"
     cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="MUESTREO" && ($4>0.05){printf "   %-22s %-14s %8.2f %13s%%\n",$2,$3,$4,$5}'
-    cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="NODO"{printf "   >> nodo %-22s CPU total %3d%% de %d núcleos (iowait %d%%)\n",$2,$3,$5,$4}'
+    cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="NODO"{printf "   >> nodo %-22s CPU total %3s%% de %d núcleos (iowait %s%%)\n",$2,$3,$5,$4}'
     # --- ms de CPU por transacción y cuello de botella
     cat "$SALIDA"/tmp/cpu_*.txt | awk -v n="$n" -v dur="$DUR" -v w="$W" '
         $1=="MUESTREO" && $3!="generador" {cpu[$3]+=$4; tot+=$4}
         END{ if(n>0){ printf "   CPU por transacción (todas las VMs):"; for(k in cpu) printf "  %s=%.3f ms", k, 1000*cpu[k]*dur/(w*n); printf "  TOTAL=%.3f ms\n", 1000*tot*dur/(w*n)}
              m=0; for(k in cpu) if(cpu[k]>m){m=cpu[k]; mk=k}
              if(tot>0) printf "   Componente que más CPU consume: %s (%.0f%% de la CPU del sistema)\n", mk, 100*m/tot }'
-    cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="NODO" && $3>=85{printf "   *** nodo %s SATURADO (CPU total %d%%) ***\n",$2,$3}'
+    cat "$SALIDA"/tmp/cpu_*.txt | awk '$1=="NODO" && $3 ~ /^[0-9]+$/ && $3>=85{printf "   *** nodo %s SATURADO (CPU total %d%%) ***\n",$2,$3}'
     echo "$earq,$N,$R,$n" >> "$SALIDA/resumen.csv"
 }
 
@@ -285,51 +311,87 @@ cmd_escalamiento() {
     fi
     local total=0 n
     for n in $PASOS; do total=$((total + PASO_S + 2)); done
-    echo "Rampa de clientes: $PASOS  (${PASO_S}s por paso, ~$((total / 60)) min)  umbral-out=${UMBRAL_OUT}% umbral-in=${UMBRAL_IN}% cubeta=$CUBETA fuga=${FUGA}/s"
+    echo "Rampa de clientes: $PASOS  (${PASO_S}s por paso + ${REPOSO_S}s de reposo, ~$(((total + REPOSO_S) / 60)) min)  umbral-out=${UMBRAL_OUT}% umbral-in=${UMBRAL_IN}% metrica=$METRICA cubeta=$CUBETA fuga=${FUGA}/s rpm/cliente=$RPM_ESC carga_cpu=${CARGA_MS}ms hilos_rmc=$HILOS_ESC"
     arrancar escalamiento || { echo "No se pudo completar el arranque (use '$0 parar' antes de reintentar)"; exit 1; }
     en "$IP_BD" "pkill -USR2 -f '[b]in/persistencia'"; sleep 4
     # CPU por segundo de las VMs que no informan al GT (la BD y esta máquina)
-    scripts/cpu_serie.sh $((total + 20)) > "$SALIDA/cpu_VM1_generador.csv" 2>&1 &
+    scripts/cpu_serie.sh $((total + REPOSO_S + 8)) > "$SALIDA/cpu_VM1_generador.csv" 2>&1 &
     SAMPLERS=($!)
-    en "$IP_BD" "scripts/cpu_serie.sh $((total + 20))" > "$SALIDA/cpu_BD.csv" 2>&1 &
+    en "$IP_BD" "scripts/cpu_serie.sh $((total + REPOSO_S + 8))" > "$SALIDA/cpu_BD.csv" 2>&1 &
     SAMPLERS+=($!)
     echo "clientes,fila_gt,paso" > "$SALIDA/pasos.csv"
-    local i=0 fila nc
+    echo "clientes,rpm_cliente,ops_s,consulta_p95_ms,reserva_p95_ms,modificacion_p95_ms,sobrecarga,errores" > "$SALIDA/pasos_resumen.csv"
+    { echo "version=$(head -1 VERSION 2>/dev/null)"; echo "fecha=$(date '+%F %T')"; echo "pasos=$PASOS"; echo "paso_s=$PASO_S"
+      echo "reposo_s=$REPOSO_S"; echo "rpm_por_cliente=$RPM_ESC"; echo "carga_cpu_ms_por_solicitud=$CARGA_MS"
+      echo "hilos_rmc_por_vm=$HILOS_ESC"; echo "hilos_bd=$HILOS_BD"; echo "umbral_out=$UMBRAL_OUT"; echo "umbral_in=$UMBRAL_IN"
+      echo "metrica=$METRICA"; echo "cubeta=$CUBETA"; echo "fuga=$FUGA"; echo "asientos_por_ocurrencia=$ASIENTOS_ESC"
+      echo "vm_gt=$IP_GT ($ET_GT)"; echo "vm_bd=$IP_BD ($ET_BD)"; echo "vm4=$IP_VM4 ($ET_VM4)"; echo "vm5=$IP_VM5 ($ET_VM5)"
+      echo "generador=$ET_GEN"; } > "$SALIDA/config.txt"
+    local i=0 fila nc npasos; npasos=$(echo $PASOS | wc -w)
     printf '\n%-8s %-9s %-22s %-22s %-22s %s\n' "Clientes" "ops/s" "CONSULTA prom/p95 ms" "RESERVA prom/p95 ms" "MODIFIC prom/p95 ms" "rechazos/errores"
     for n in $PASOS; do
         i=$((i + 1))
         fila=$(en "$IP_GT" "wc -l < logs/escala.csv" 2>/dev/null | tail -1)
         echo "$n,${fila:-0},$i" >> "$SALIDA/pasos.csv"
         # shellcheck disable=SC2046
-        timeout $((PASO_S + 30)) bin/generador --clientes "$n" --solo-consulta $((n / 4)) --pct-consulta 30 --pct-reserva 50 --pct-modificar 20 \
-            --rpm 0 --duracion "$PASO_S" --calentamiento 0 --gt "tcp://$IP_GT:5555" --notif "tcp://$IP_GT:5558" \
-            --arquitectura escalamiento --repeticion "$i" --muestras "$SALIDA/paso${i}_muestras.csv" \
-            > "$SALIDA/paso${i}_c${n}.gen.log" 2>&1
-        awk -v n="$n" -v dur="$PASO_S" '
+        [ "$EN_VIVO" -gt 0 ] && echo "   >>> paso $i de $npasos: $n clientes durante ${PASO_S}s (solicitudes en vivo, una línea por segundo)" >&2
+        gen_vivo "$SALIDA/paso${i}_c${n}.gen.log" $((PASO_S + 30)) --clientes "$n" --solo-consulta $((n / 4)) --pct-consulta 30 --pct-reserva 50 --pct-modificar 20 \
+            --rpm "$RPM_ESC" --duracion "$PASO_S" --calentamiento 0 --gt "tcp://$IP_GT:5555" --notif "tcp://$IP_GT:5558" \
+            --arquitectura escalamiento --repeticion "$i" --muestras "$SALIDA/paso${i}_muestras.csv"
+        awk -v n="$n" -v dur="$PASO_S" -v rpm="$RPM_ESC" -v f="$SALIDA/pasos_resumen.csv" '
             /CONSULTA:/{split($0,a," "); for(k in a){if(a[k]~/^n=/)cn=substr(a[k],3); if(a[k]~/^prom=/)cp=substr(a[k],6); if(a[k]~/^p95=/)c95=substr(a[k],5)}}
             /RESERVA:/{for(k=1;k<=NF;k++){if($k~/^n=/)rn=substr($k,3); if($k~/^prom=/)rp=substr($k,6); if($k~/^p95=/)r95=substr($k,5)}}
             /MODIFIC/{for(k=1;k<=NF;k++){if($k~/^n=/)mn=substr($k,3); if($k~/^prom=/)mp=substr($k,6); if($k~/^p95=/)m95=substr($k,5)}}
             /errores=/{for(k=1;k<=NF;k++){if($k~/^errores=/)er=substr($k,9); if($k~/^sobrecarga=/)sb=substr($k,11)}}
-            END{printf "%-8d %-9.0f %-22s %-22s %-22s %s/%s\n", n, (cn+rn+mn)/dur, cp"/"c95, rp"/"r95, mp"/"m95, sb+0, er+0}' "$SALIDA/paso${i}_c${n}.gen.log"
+            END{printf "%-8d %-9.0f %-22s %-22s %-22s %s/%s\n", n, (cn+rn+mn)/dur, cp"/"c95, rp"/"r95, mp"/"m95, sb+0, er+0
+                printf "%d,%d,%.1f,%s,%s,%s,%d,%d\n", n, rpm, (cn+rn+mn)/dur, c95+0, r95+0, m95+0, sb+0, er+0 >> f}' "$SALIDA/paso${i}_c${n}.gen.log"
     done
+    echo; echo "Reposo de ${REPOSO_S} s sin carga (el GT libera las VMs que ya no hacen falta)..."
+    sleep "$REPOSO_S"
     wait "${SAMPLERS[@]}" 2>/dev/null
     en "$IP_GT" "cat logs/escala.csv" > "$SALIDA/escala_gt.csv" 2>/dev/null
     en "$IP_GT" "grep -E 'ESCALA|CUBETA|RMC registrado|sin señales' logs/gt1.log" > "$SALIDA/eventos_gt.txt" 2>/dev/null
     echo; echo "== Eventos del GT (escalado y cubeta) =="; grep -E "ESCALA|CUBETA" "$SALIDA/eventos_gt.txt" | sed 's/^/   /'
     if python3 -c "import pandas, matplotlib" 2>/dev/null; then
-        python3 analisis/escalamiento.py "$SALIDA" --umbral-out "$UMBRAL_OUT" --umbral-in "$UMBRAL_IN"
+        python3 analisis/escalamiento.py "$SALIDA" --umbral-out "$UMBRAL_OUT" --umbral-in "$UMBRAL_IN" --paso-s $((PASO_S + 2)) ${TITULO_ESC:+--titulo "$TITULO_ESC"}
     else
         echo "(instale pandas y matplotlib para el gráfico:  pip3 install pandas matplotlib ; luego: python3 analisis/escalamiento.py $SALIDA)"
     fi
+    if [ -n "$VEREDICTO_ESC" ]; then
+        python3 analisis/veredicto.py "$SALIDA" "$VEREDICTO_ESC" --umbral-out "$UMBRAL_OUT" || true
+    fi
     echo; echo "Listo. Archivos en $SALIDA/ . Guarde también la salida de esta ejecución."
+    echo "(La topología sigue en marcha; para detenerla:  scripts/prueba_empirica.sh parar)"
+}
+
+# test1: la carga cabe en UNA VM (VM3): no debe haber scale-out ni cubeta, y VM4/VM5 no reciben trabajo.
+cmd_test1() {
+    SALIDA_ESC=${SALIDA_T1:-resultados_test1}
+    PASOS=${T1_PASOS:-"3 6 9"}; PASO_S=${T1_PASO_S:-30}; RPM_ESC=${T1_RPM:-600}; REPOSO_S=${T1_REPOSO_S:-15}
+    CARGA_MS=${CARGA_T:-10}; HILOS_ESC=${HILOS_T:-8}
+    TITULO_ESC="test1: una VM es suficiente para el tráfico"; VEREDICTO_ESC=test1
+    echo "== test1: carga ligera (clientes $PASOS a ${RPM_ESC} solicitudes/min cada uno); debe atenderla solo VM3 =="
+    cmd_escalamiento
+}
+
+# test2: la carga crece hasta ocupar las 3 VMs: scale-out a vm4 y vm5, CPU al límite y leaky bucket.
+cmd_test2() {
+    SALIDA_ESC=${SALIDA_T2:-resultados_test2}
+    PASOS=${T2_PASOS:-"2 4 8 12 16 24 32 48 64 96 128"}; PASO_S=${T2_PASO_S:-30}; RPM_ESC=0; REPOSO_S=${T2_REPOSO_S:-45}
+    CARGA_MS=${CARGA_T:-10}; HILOS_ESC=${HILOS_T:-8}; CUBETA=${CUBETA_T2:-40}   # cubeta chica: con 24 trabajadores ocupados rechaza desde ~64 clientes
+    TITULO_ESC="test2: carga creciente hasta ocupar las 3 VMs"; VEREDICTO_ESC=test2
+    echo "== test2: rampa de clientes $PASOS sin pausa entre solicitudes; deben activarse vm4 y vm5 y la cubeta =="
+    cmd_escalamiento
 }
 
 case "${1:-}" in
     mapa) cmd_mapa ;;
     escalamiento) cmd_escalamiento ;;
+    test1) cmd_test1 ;;
+    test2) cmd_test2 ;;
     procedimientos) cmd_procedimientos "${2:-}" ;;
     verificar) cmd_verificar ;;
     correr) cmd_correr "${2:-}" ;;
     parar) parar_todo; echo "Procesos del SRB detenidos en: $HOSTS" ;;
-    *) sed -n '2,24p' "$0"; exit 2 ;;
+    *) awk 'NR>1 && /^#/{print; next} NR>1{exit}' "$0"; exit 2 ;;
 esac

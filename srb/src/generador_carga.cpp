@@ -16,9 +16,13 @@
 //        [--mes 202611] [--eventos 50] [--dobles 20] [--max-asientos 4]
 //        [--calentamiento 5] [--timeout-ms 4000] [--reintentos 3] [--semilla 1] [--backoff-ms 50]
 //        [--arquitectura base|escalable] [--repeticion 1]
-//        [--csv resumen.csv] [--muestras muestras.csv]
+//        [--csv resumen.csv] [--muestras muestras.csv] [--en-vivo SEG]
 //   --rpm 0  = sin pausa entre solicitudes (máxima carga).
+//   --en-vivo SEG  imprime cada SEG segundos una línea "[EN VIVO]" con las solicitudes enviadas, respondidas,
+//                  el ritmo por segundo, las que están en curso, las rechazadas por SOBRECARGA y las fallas
+//                  (0 = apagado, por defecto). Cuenta TODO lo que ve el generador, incluido el calentamiento.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -175,11 +179,19 @@ struct Parametros {
     int clientes, soloConsulta, rpm, duracion, calentamiento, timeoutMs, reintentos, semilla;
     int pctConsulta, pctReserva, pctModificar, pctCancelar;
     int backoffMs = 50;  // espera tras un rechazo por SOBRECARGA
+    int enVivo = 0;      // cada cuántos segundos se imprime el contador en vivo (0 = apagado)
     int mes, eventos, dobles, maxAsientos, vmIndice, vmTotal, repeticion;
 };
 
 struct ReservaPropia {
     int idReserva, idEvento, idOcurrencia, numAsientos;
+};
+
+// Contadores en vivo: atómicos y sin mutex, para que contar no frene a los clientes.
+struct Vivo {
+    std::atomic<long> enviadas{0}, respondidas{0}, rechazadas{0}, timeouts{0}, errores{0};
+    std::atomic<long> porTipo[3];  // respondidas: consulta, reserva, modificación
+    Vivo() { for (auto& a : porTipo) a.store(0); }
 };
 
 class GeneradorCarga {
@@ -202,12 +214,58 @@ public:
         base_ = static_cast<long>(std::time(nullptr) % 10000000L) * 1000000L;
         t0_ = ahoraSeg();
         std::vector<std::thread> hilos;
+        std::atomic<bool> terminado{false};
+        std::thread vivo;
+        if (p_.enVivo > 0) vivo = std::thread(&GeneradorCarga::imprimirVivo, this, static_cast<int>(mios.size()), &terminado);
         for (int i : mios) hilos.emplace_back(&GeneradorCarga::cicloCliente, this, i);
         for (auto& h : hilos) h.join();
+        terminado = true;
+        if (vivo.joinable()) vivo.join();
         informar(static_cast<int>(mios.size()));
     }
 
 private:
+    // Cuenta en vivo el resultado de una solicitud ya enviada.
+    void contarVivo(TipoOperacion tipo, bool ok, Estado e) {
+        if (!ok) { vivo_.timeouts++; return; }
+        if (e == Estado::SOBRECARGA) { vivo_.rechazadas++; return; }
+        vivo_.respondidas++;
+        if (e == Estado::ERROR) vivo_.errores++;
+        int i = tipo == TipoOperacion::CONSULTA ? 0 : (tipo == TipoOperacion::RESERVA ? 1 : 2);
+        vivo_.porTipo[i]++;
+    }
+
+    // Una línea cada p_.enVivo segundos con lo que está pasando AHORA (hilo aparte, solo lee los contadores).
+    void imprimirVivo(int clientesAqui, std::atomic<bool>* terminado) {
+        const double paso = p_.enVivo;
+        double proximo = t0_ + paso, anterior = t0_;
+        long hechasAntes = 0;
+        bool ultima = false;
+        while (!ultima) {
+            while (!*terminado && ahoraSeg() < proximo)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ultima = *terminado;
+            double ahora = ahoraSeg();
+            long env = vivo_.enviadas, res = vivo_.respondidas, rech = vivo_.rechazadas, to = vivo_.timeouts;
+            long hechas = res + rech + to;
+            double dt = std::max(0.001, ahora - anterior);
+            // en la línea final se muestra el ritmo medio de toda la corrida (el último intervalo es casi vacío)
+            double ritmo = ultima ? hechas / std::max(0.001, ahora - t0_) : (hechas - hechasAntes) / dt;
+            char b[320];
+            std::snprintf(b, sizeof b,
+                          "%st=%3.0fs clientes=%d | enviadas=%ld respondidas=%ld %s=%.0f/s en_curso=%ld | "
+                          "consulta=%ld reserva=%ld modif=%ld | rechazadas=%ld fallas=%ld",
+                          ultima ? "FIN " : "", ahora - t0_, clientesAqui, env, res,
+                          ultima ? "media" : "ahora", ritmo, env - hechas, vivo_.porTipo[0].load(),
+                          vivo_.porTipo[1].load(), vivo_.porTipo[2].load(), rech, to + vivo_.errores.load());
+            logLinea("EN VIVO", b);
+            hechasAntes = hechas;
+            anterior = ahora;
+            proximo += paso;
+            if (proximo < ahora) proximo = ahora + paso;
+        }
+    }
+
     // Perfil de un cliente: qué operación pide a continuación.
     TipoOperacion elegirTipo(bool soloConsulta, std::mt19937& rng, bool hayReservas) {
         if (soloConsulta) return TipoOperacion::CONSULTA;
@@ -278,7 +336,10 @@ private:
             Mensaje m = generarSolicitud(idCliente, base_ + (++seq),
                                          TipoOperacion::CONSULTA, rng, misReservas, calendario), r;
             int intentos, cambios;
-            if (cliente.enviarSolicitud(m, r, intentos, cambios)) actualizarCalendario(r);
+            vivo_.enviadas++;
+            bool ok0 = cliente.enviarSolicitud(m, r, intentos, cambios);
+            contarVivo(TipoOperacion::CONSULTA, ok0, r.resultado);
+            if (ok0) actualizarCalendario(r);
         }
 
         const double intervalo = p_.rpm > 0 ? 60.0 / p_.rpm : 0.0;
@@ -291,8 +352,10 @@ private:
             Mensaje r;
             int intentos = 0, cambios = 0;
             double ts = ahoraSeg();
+            vivo_.enviadas++;
             bool ok = cliente.enviarSolicitud(m, r, intentos, cambios);
             double ms = (ahoraSeg() - ts) * 1000.0;
+            contarVivo(tipo, ok, r.resultado);
             double t = ts - t0_;
             bool medir = t >= p_.calentamiento;  // se descartan los primeros segundos
 
@@ -410,6 +473,7 @@ private:
     Parametros p_;
     zmq::context_t ctx_;
     Metricas metricas;
+    Vivo vivo_;
     double t0_ = 0.0;
     long base_ = 0;
 };
@@ -435,6 +499,7 @@ int main(int argc, char** argv) {
     p.pctModificar = argInt(argc, argv, "--pct-modificar", 20);
     p.pctCancelar = argInt(argc, argv, "--pct-cancelar", 0);
     p.backoffMs = argInt(argc, argv, "--backoff-ms", p.backoffMs);
+    p.enVivo = std::max(0, argInt(argc, argv, "--en-vivo", 0));
     p.mes = argInt(argc, argv, "--mes", 202611);
     p.eventos = std::max(1, argInt(argc, argv, "--eventos", 50));
     p.dobles = argInt(argc, argv, "--dobles", 20);

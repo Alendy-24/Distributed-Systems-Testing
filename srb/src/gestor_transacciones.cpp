@@ -12,10 +12,14 @@
 // Escalado por CPU (scale-out / scale-in) y leaky bucket (opcionales; sin --escalar todo se comporta como antes):
 //   --escalar base,vm4,vm5   VMs de RMC en orden de activación (el nombre es el --nombre del RMC). Solo se reparte
 //                            entre los RMC de los niveles activos; empieza con el primero. Cada RMC informa la CPU
-//                            de su nodo en el heartbeat. Cuando la CPU del ÚLTIMO nivel activo se mantiene >=
-//                            --umbral-out (50 %) durante --sostenido-out s, se activa el siguiente (scale-out); cuando
-//                            esa CPU queda < --umbral-in (20 %) durante --sostenido-in s y el nivel anterior tiene
-//                            holgura, se libera el último (scale-in; sus RMC terminan lo que tienen y quedan en espera).
+//                            de su nodo en el heartbeat. Cuando la CPU de la VM MÁS CARGADA de las activas se mantiene
+//                            >= --umbral-out (50 %) durante --sostenido-out s, se activa el siguiente (scale-out); cuando
+//                            la CPU del último nivel queda < --umbral-in (20 %) durante --sostenido-in s y los niveles
+//                            anteriores tienen holgura (< umbral-out - 10), se libera el último (scale-in; sus RMC terminan
+//                            lo que tienen y quedan en espera).
+//   --escala-metrica max|ultimo   qué CPU decide el scale-out y la cubeta: "max" (por defecto) = la VM más cargada de
+//                            las activas (necesario cuando el GT comparte VM con el primer nivel: esa VM es la que se
+//                            calienta primero y las demás solo hacen de RMC); "ultimo" = solo la del último nivel activo.
 //   --cubeta N --fuga R      leaky bucket: cuando ya no hay más niveles que activar y el último está al límite, la
 //                            cubeta (cola de espera de N solicitudes) se vacía a R solicitudes/s hacia los RMC; lo
 //                            que desborda se rechaza de inmediato con SOBRECARGA (el cliente no espera ni reintenta).
@@ -24,7 +28,7 @@
 // Uso: ./gestor [--bind tcp://*:5555] [--bind-rmc tcp://*:5556] [--cancel tcp://localhost:5557]
 //               [--hb-ms 500] [--liveness 4] [--ttl 15] [--stats-csv archivo]
 //               [--escalar base,vm4,vm5 --umbral-out 50 --umbral-in 20 --sostenido-out 3 --sostenido-in 10
-//                --enfriar 8] [--cubeta 200 --fuga 800] [--linea-tiempo archivo]
+//                --enfriar 8 --escala-metrica max] [--cubeta 200 --fuga 800] [--linea-tiempo archivo]
 //               [--nombre GT] [--silencioso]
 //   kill -USR1 <pid>   imprime las estadísticas, las agrega al CSV y reinicia los contadores
 #include <algorithm>
@@ -50,7 +54,8 @@ public:
         std::string nombre = "GT";
         // --- escalado por CPU y leaky bucket
         std::vector<std::string> niveles;  // VMs de RMC en orden de activación (vacío = sin escalado)
-        double umbralOut = 50.0;           // % de CPU del último nivel activo que dispara el scale-out
+        double umbralOut = 50.0;           // % de CPU (de la VM más cargada de las activas) que dispara el scale-out
+        std::string metrica = "max";       // "max" = VM más cargada de las activas; "ultimo" = solo el último nivel activo
         double umbralIn = 20.0;            // % de CPU bajo el cual se libera el último nivel (scale-in)
         double sostenidoOut = 3.0;         // s que la CPU debe mantenerse alta antes de escalar
         double sostenidoIn = 10.0;         // s que debe mantenerse baja antes de liberar
@@ -84,7 +89,7 @@ public:
             std::string s;
             for (const std::string& n : cfg.niveles) s += (s.empty() ? "" : " -> ") + n;
             logLinea(cfg.nombre, "escalado por CPU: niveles " + s + " (out>=" + fmt0(cfg.umbralOut) + "%, in<" +
-                                     fmt0(cfg.umbralIn) + "%)" +
+                                     fmt0(cfg.umbralIn) + "%, métrica " + cfg.metrica + ")" +
                                      (cfg.cubeta > 0 ? "; leaky bucket cubeta=" + std::to_string(cfg.cubeta) +
                                                            " fuga=" + fmt0(cfg.fuga) + "/s"
                                                      : ""));
@@ -397,11 +402,24 @@ private:
         if (activos < 1) activos = 1;
 
         const int ultimo = activos - 1;
-        double c = cpuNivel(ultimo, hay, ahora);
-        double cPrev = 0;
+        double c = cpuNivel(ultimo, hay, ahora);  // CPU del último nivel activo (decide el scale-in)
+        double cPrev = 0;                         // CPU de los niveles anteriores (holgura para el scale-in)
         if (ultimo > 0) cPrev = cpuNivel(ultimo - 1, hay, ahora);
+        double cOut = c;                          // CPU que decide el scale-out y la cubeta
+        int caliente = ultimo;                    // nivel al que pertenece cOut
+        if (cfg.metrica == "max") {
+            cPrev = 0;
+            for (int n = 0; n <= ultimo; ++n) {
+                double v = cpuNivel(n, hay, ahora);
+                if (v > cOut) {
+                    cOut = v;
+                    caliente = n;
+                }
+                if (n < ultimo && v > cPrev) cPrev = v;
+            }
+        }
         bool enfriado = ahora - tCambio >= cfg.enfriar;
-        if (c >= cfg.umbralOut) {
+        if (cOut >= cfg.umbralOut) {
             if (tAlto == 0.0) tAlto = ahora;
         } else {
             tAlto = 0.0;
@@ -418,7 +436,7 @@ private:
                 ++activos;
                 tCambio = ahora;
                 tAlto = tBajo = 0.0;
-                logLinea(cfg.nombre, "ESCALA-OUT: CPU de '" + cfg.niveles[ultimo] + "' = " + fmt0(c) + "% >= " +
+                logLinea(cfg.nombre, "ESCALA-OUT: CPU de '" + cfg.niveles[caliente] + "' = " + fmt0(cOut) + "% >= " +
                                          fmt0(cfg.umbralOut) + "% -> se activa '" + cfg.niveles[activos - 1] +
                                          "' (" + std::to_string(activos) + "/" + std::to_string(K) + " niveles)");
             }
@@ -427,17 +445,17 @@ private:
             tCubetaBaja = 0.0;
             fichas = 1.0;
             logLinea(cfg.nombre, "CUBETA ACTIVA: todos los niveles disponibles (" + std::to_string(activos) +
-                                     ") están al límite (CPU '" + cfg.niveles[ultimo] + "' = " + fmt0(c) +
+                                     ") están al límite (CPU '" + cfg.niveles[caliente] + "' = " + fmt0(cOut) +
                                      "%); salida " + (cfg.fuga > 0 ? fmt0(cfg.fuga) + "/s" : std::string("libre")) +
                                      ", capacidad " + std::to_string(cfg.cubeta));
         }
         if (cubetaActiva) {  // la cubeta se libera cuando hay holgura (o se activó otro nivel)
-            if (c < cfg.umbralOut - 10.0 || activos < disp) {
+            if (cOut < cfg.umbralOut - 10.0 || activos < disp) {
                 if (tCubetaBaja == 0.0) tCubetaBaja = ahora;
                 if (ahora - tCubetaBaja >= cfg.sostenidoOut) {
                     cubetaActiva = false;
                     tCubetaBaja = 0.0;
-                    logLinea(cfg.nombre, "CUBETA LIBERADA: CPU de '" + cfg.niveles[ultimo] + "' = " + fmt0(c) + "%");
+                    logLinea(cfg.nombre, "CUBETA LIBERADA: CPU de '" + cfg.niveles[caliente] + "' = " + fmt0(cOut) + "%");
                 }
             } else {
                 tCubetaBaja = 0.0;
@@ -673,6 +691,7 @@ int main(int argc, char** argv) {
     if (c.niveles.size() > 60) c.niveles.resize(60);
     c.umbralOut = argDbl(argc, argv, "--umbral-out", c.umbralOut);
     c.umbralIn = argDbl(argc, argv, "--umbral-in", c.umbralIn);
+    c.metrica = argStr(argc, argv, "--escala-metrica", c.metrica) == "ultimo" ? "ultimo" : "max";
     c.sostenidoOut = argDbl(argc, argv, "--sostenido-out", c.sostenidoOut);
     c.sostenidoIn = argDbl(argc, argv, "--sostenido-in", c.sostenidoIn);
     c.enfriar = argDbl(argc, argv, "--enfriar", c.enfriar);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Gráfico y resumen de la prueba de escalamiento (scripts/prueba_empirica.sh escalamiento).
 
-Uso:  python3 analisis/escalamiento.py resultados_escalamiento [--umbral-out 50] [--umbral-in 20]
+Uso:  python3 analisis/escalamiento.py resultados_escalamiento [--umbral-out 50] [--umbral-in 20] [--paso-s 27]
 
 Lee de la carpeta:  escala_gt.csv (línea de tiempo del GT, una fila por segundo), pasos.csv (cuándo empezó cada
 paso de la rampa), cpu_VM1_generador.csv y cpu_BD.csv (CPU por segundo de VM1 y de la VM de la BD).
@@ -28,11 +28,32 @@ def leer(ruta):
         return None
 
 
+def leer_cpu(ruta, nombre, avisos):
+    """CSV t_s,cpu_pct de una VM; descarta lo que no sea un porcentaje válido (0..100) y lo avisa."""
+    d = leer(ruta)
+    if d is None or "cpu_pct" not in d.columns:
+        return None
+    d = d[pd.to_numeric(d["t_s"], errors="coerce").notnull()].copy()
+    d["t_s"] = pd.to_numeric(d["t_s"])
+    d["cpu_pct"] = pd.to_numeric(d["cpu_pct"], errors="coerce")
+    malas = int(((d["cpu_pct"] < 0) | (d["cpu_pct"] > 100) | d["cpu_pct"].isnull()).sum())
+    d.loc[(d["cpu_pct"] < 0) | (d["cpu_pct"] > 100), "cpu_pct"] = float("nan")
+    if malas:
+        avisos.append("AVISO: %d de %d muestras de CPU de %s no eran un porcentaje válido (se ignoran). "
+                      "Si son casi todas, la medición de esa VM no es confiable: pegue cpu_%s.csv." %
+                      (malas, len(d), nombre, "BD" if nombre.startswith("la BD") else "VM1_generador"))
+    if d["cpu_pct"].notnull().sum() == 0:
+        return None
+    return d
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carpeta")
     ap.add_argument("--umbral-out", type=float, default=50.0)
     ap.add_argument("--umbral-in", type=float, default=20.0)
+    ap.add_argument("--paso-s", type=float, default=0.0, help="duración de un paso (s) para delimitar el último")
+    ap.add_argument("--titulo", default="Escalamiento por CPU: scale-out, scale-in y leaky bucket")
     a = ap.parse_args()
     d = a.carpeta
 
@@ -40,8 +61,9 @@ def main():
     if gt is None or len(gt) == 0:
         sys.exit("No hay %s/escala_gt.csv (o está vacío): ¿corrió el GT con --linea-tiempo?" % d)
     pasos = leer(os.path.join(d, "pasos.csv"))
-    vm1 = leer(os.path.join(d, "cpu_VM1_generador.csv"))
-    bd = leer(os.path.join(d, "cpu_BD.csv"))
+    avisos = []
+    vm1 = leer_cpu(os.path.join(d, "cpu_VM1_generador.csv"), "VM1", avisos)
+    bd = leer_cpu(os.path.join(d, "cpu_BD.csv"), "la BD (VM2)", avisos)
 
     niveles = [c[4:] for c in gt.columns if c.startswith("cpu_")]
     t = gt["t_s"].astype(float)
@@ -51,6 +73,12 @@ def main():
     if pasos is not None and len(pasos) > 0:
         for _, r in pasos.iterrows():
             inicios.append((max(0.0, float(r["fila_gt"]) - 1.0), int(r["clientes"])))
+    if inicios:
+        difs = sorted(inicios[k + 1][0] - inicios[k][0] for k in range(len(inicios) - 1))
+        paso_s = a.paso_s if a.paso_s > 0 else (difs[len(difs) // 2] if difs else 30.0)
+        fin_rampa = inicios[-1][0] + paso_s  # donde termina la rampa; después viene el reposo (sin carga)
+    else:
+        paso_s, fin_rampa = 30.0, float(t.iloc[-1]) + 1
     off = inicios[0][0] - 1.0 if inicios else 0.0  # las series de VM1 y BD empiezan ~1 s antes del primer paso
 
     fig, ax = plt.subplots(4, 1, figsize=(11, 11), sharex=True)
@@ -64,7 +92,7 @@ def main():
     ax[0].axhline(a.umbral_in, color="gray", ls=":", lw=1, label="umbral scale-in (%d%%)" % a.umbral_in)
     ax[0].set_ylabel("CPU de la VM (%)")
     ax[0].set_ylim(0, 105)
-    ax[0].set_title("Escalamiento por CPU: scale-out, scale-in y leaky bucket")
+    ax[0].set_title(a.titulo)
     # franjas: niveles activos
     nivel_act = gt["niveles_activos"].astype(int).tolist()
     for k in range(len(t)):
@@ -86,9 +114,11 @@ def main():
     if inicios:
         xs, ys = [], []
         for k, (ini, nc) in enumerate(inicios):
-            fin = inicios[k + 1][0] if k + 1 < len(inicios) else float(t.iloc[-1])
+            fin = inicios[k + 1][0] if k + 1 < len(inicios) else fin_rampa
             xs += [ini, fin]
             ys += [nc, nc]
+        xs += [fin_rampa, float(t.iloc[-1])]
+        ys += [0, 0]
         ax1b.step(xs, ys, where="post", color="black", lw=1, alpha=0.7)
     ax1b.set_ylabel("clientes concurrentes", color="black")
     h1, l1 = ax[1].get_legend_handles_labels()
@@ -117,8 +147,10 @@ def main():
 
     # --- resumen por paso
     filas = []
-    for k, (ini, nc) in enumerate(inicios):
-        fin = inicios[k + 1][0] if k + 1 < len(inicios) else float(t.iloc[-1]) + 1
+    ventanas = [(ini, inicios[k + 1][0] if k + 1 < len(inicios) else fin_rampa, nc) for k, (ini, nc) in enumerate(inicios)]
+    if inicios and float(t.iloc[-1]) - fin_rampa >= 5:  # reposo: sin carga (muestra la línea base y el scale-in final)
+        ventanas.append((fin_rampa + 2, float(t.iloc[-1]) + 1, 0))
+    for (ini, fin, nc) in ventanas:
         m = (t >= ini) & (t < fin)
         g = gt[m]
         if len(g) == 0:
@@ -135,14 +167,15 @@ def main():
             fila["cpu_" + n] = g["cpu_" + n].mean()
         if bd is not None:
             b = bd[((bd["t_s"] + off) >= ini) & ((bd["t_s"] + off) < fin)]
-            fila["cpu_BD"] = b["cpu_pct"].mean() if len(b) else float("nan")
+            fila["cpu_BD"] = b["cpu_pct"].mean() if b["cpu_pct"].notnull().any() else float("nan")
         if vm1 is not None:
             v = vm1[((vm1["t_s"] + off) >= ini) & ((vm1["t_s"] + off) < fin)]
-            fila["cpu_VM1"] = v["cpu_pct"].mean() if len(v) else float("nan")
+            fila["cpu_VM1"] = v["cpu_pct"].mean() if v["cpu_pct"].notnull().any() else float("nan")
         filas.append(fila)
     res = pd.DataFrame(filas)
 
-    lineas = ["# Escalamiento por CPU: resumen por paso de la rampa", ""]
+    lineas = ["# Escalamiento por CPU: resumen por paso de la rampa", "",
+              "(clientes = 0: reposo al final, sin carga; muestra la CPU base de cada VM y el scale-in)", ""]
     if len(res):
         cols = list(res.columns)
         lineas.append("| " + " | ".join(cols) + " |")
@@ -165,6 +198,8 @@ def main():
         lineas.append("Leaky bucket activo durante %d s; rechazadas por SOBRECARGA en total: %d." % (t_cub, int(gt["sobrecarga"].sum())))
     else:
         lineas.append("El leaky bucket no llegó a activarse (el último nivel nunca se mantuvo sobre el umbral).")
+    for av in avisos:
+        lineas.append(av)
     if bd is not None:
         lineas.append("CPU de la BD: media %.0f %%, máxima %.0f %%." % (bd["cpu_pct"].mean(), bd["cpu_pct"].max()))
         if bd["cpu_pct"].max() >= 85:

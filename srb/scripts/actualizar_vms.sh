@@ -62,9 +62,9 @@ for ip in $HOSTS; do
         echo "   ERROR: no hay ssh o $(ruta_de "$ip") no es un clon git en esa VM (haga allí: git clone <url> y revise RUTA/RUTA_* en vms.conf)"; mal=1; continue
     fi
     t=$(destinos "$ip")
-    salida=$(en "$ip" "git pull --ff-only 2>&1 && make $t 2>&1 | grep -E 'error|Error|undefined' ; echo \"versión: \$(cat VERSION 2>/dev/null || echo '?')  | binarios: $t\"")
+    salida=$(en "$ip" "git pull --ff-only 2>&1; make $t 2>&1 | grep -E 'error|Error|undefined|not found|No such file|No rule' ; echo \"versión: \$(cat VERSION 2>/dev/null || echo '?')  | binarios: $t\"; for b in $t; do test -x \$b || echo \"FALTA \$b: no se compiló (compruebe: cd \$PWD && make \$b)\"; done")
     echo "$salida" | sed 's/^/   /'
-    echo "$salida" | grep -qE "error|Error|undefined|fatal|CONFLICT" && { echo "   >>> REVISAR: hubo errores en esta VM"; mal=1; }
+    echo "$salida" | grep -qE "error|Error|undefined|fatal|CONFLICT|not found|No such file|FALTA" && { echo "   >>> REVISAR: hubo errores en esta VM"; mal=1; }
 done
 echo
 [ "$mal" = 0 ] && echo "Todas las VMs actualizadas. Reinicie los servicios (scripts/prueba_empirica.sh parar) para usar los binarios nuevos." \
