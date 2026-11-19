@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -22,7 +23,8 @@ namespace srb {
 // ---------------------------------------------------------------- Tipos --
 
 enum class TipoOperacion { CONSULTA = 0, RESERVA = 1, MODIFICACION = 2, CANCELACION = 3 };
-enum class Estado { EXITO = 0, RECHAZO = 1, ERROR = 2 };
+// SOBRECARGA: el GT descartó la solicitud sin procesarla porque su cubeta (leaky bucket) estaba llena.
+enum class Estado { EXITO = 0, RECHAZO = 1, ERROR = 2, SOBRECARGA = 3 };
 
 inline const char* nombre(TipoOperacion t) {
     switch (t) {
@@ -39,6 +41,7 @@ inline const char* nombre(Estado e) {
         case Estado::EXITO: return "EXITO";
         case Estado::RECHAZO: return "RECHAZO";
         case Estado::ERROR: return "ERROR";
+        case Estado::SOBRECARGA: return "SOBRECARGA";
     }
     return "?";
 }
@@ -155,7 +158,7 @@ inline bool deserializar(const std::string& s, Mensaje& m) {
         r.numAsientosNuevo = std::stoi(f[10]);
         r.tsEnvio = std::stod(f[11]);
         int e = std::stoi(f[12]);
-        if (e < 0 || e > 2) return false;
+        if (e < 0 || e > 3) return false;
         r.resultado = static_cast<Estado>(e);
         if (!f[13].empty()) {
             for (const std::string& item : dividir(f[13], ';')) {
@@ -213,6 +216,48 @@ inline double relojPared() {
     using namespace std::chrono;
     return duration<double>(system_clock::now().time_since_epoch()).count();
 }
+
+// CPU de TODO el nodo (% de la capacidad de todos sus núcleos), medida sobre ventanas de >= 1 s a partir de
+// /proc/stat. Con 'simulada' (ruta de un archivo con un número 0..100) devuelve ese valor: sirve para ensayar el
+// escalado sin generar carga real. Es seguro llamarla desde varios hilos.
+class MedidorCPU {
+public:
+    explicit MedidorCPU(std::string simulada = "") : sim_(std::move(simulada)) {}
+    double porcentaje() {
+        if (!sim_.empty()) {
+            std::ifstream f(sim_);
+            double v = 0;
+            if (!(f >> v)) return 0.0;
+            return v < 0 ? 0.0 : (v > 100 ? 100.0 : v);
+        }
+        std::lock_guard<std::mutex> g(mtx_);
+        long long busy = 0, total = 0;
+        if (!leer(busy, total)) return ultimo_;
+        double ahora = ahoraSeg();
+        if (t_ == 0.0 || ahora - t_ >= 1.0) {
+            if (t_ != 0.0 && total > total_) ultimo_ = 100.0 * (busy - busy_) / static_cast<double>(total - total_);
+            busy_ = busy;
+            total_ = total;
+            t_ = ahora;
+        }
+        return ultimo_;
+    }
+
+private:
+    static bool leer(long long& busy, long long& total) {
+        std::ifstream f("/proc/stat");
+        std::string cpu;
+        long long u = 0, n = 0, s = 0, id = 0, io = 0, irq = 0, sirq = 0, st = 0;
+        if (!(f >> cpu >> u >> n >> s >> id >> io >> irq >> sirq >> st) || cpu != "cpu") return false;
+        busy = u + n + s + irq + sirq + st;
+        total = busy + id + io;
+        return true;
+    }
+    std::string sim_;
+    std::mutex mtx_;
+    long long busy_ = 0, total_ = 0;
+    double t_ = 0.0, ultimo_ = 0.0;
+};
 
 inline std::string nombreMaquina() {
     char b[128] = {0};

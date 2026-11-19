@@ -9,10 +9,25 @@
 // El GT de relevo es este mismo programa en otra máquina: los RMC se registran en ambos y
 // los clientes pasan al de relevo cuando el principal deja de responder.
 //
+// Escalado por CPU (scale-out / scale-in) y leaky bucket (opcionales; sin --escalar todo se comporta como antes):
+//   --escalar base,vm4,vm5   VMs de RMC en orden de activación (el nombre es el --nombre del RMC). Solo se reparte
+//                            entre los RMC de los niveles activos; empieza con el primero. Cada RMC informa la CPU
+//                            de su nodo en el heartbeat. Cuando la CPU del ÚLTIMO nivel activo se mantiene >=
+//                            --umbral-out (50 %) durante --sostenido-out s, se activa el siguiente (scale-out); cuando
+//                            esa CPU queda < --umbral-in (20 %) durante --sostenido-in s y el nivel anterior tiene
+//                            holgura, se libera el último (scale-in; sus RMC terminan lo que tienen y quedan en espera).
+//   --cubeta N --fuga R      leaky bucket: cuando ya no hay más niveles que activar y el último está al límite, la
+//                            cubeta (cola de espera de N solicitudes) se vacía a R solicitudes/s hacia los RMC; lo
+//                            que desborda se rechaza de inmediato con SOBRECARGA (el cliente no espera ni reintenta).
+//   --linea-tiempo archivo   CSV con una fila por segundo: niveles activos, CPU de cada nivel, reparto, cola, rechazos.
+//
 // Uso: ./gestor [--bind tcp://*:5555] [--bind-rmc tcp://*:5556] [--cancel tcp://localhost:5557]
 //               [--hb-ms 500] [--liveness 4] [--ttl 15] [--stats-csv archivo]
+//               [--escalar base,vm4,vm5 --umbral-out 50 --umbral-in 20 --sostenido-out 3 --sostenido-in 10
+//                --enfriar 8] [--cubeta 200 --fuga 800] [--linea-tiempo archivo]
 //               [--nombre GT] [--silencioso]
 //   kill -USR1 <pid>   imprime las estadísticas, las agrega al CSV y reinicia los contadores
+#include <algorithm>
 #include <deque>
 #include <fstream>
 #include <map>
@@ -33,6 +48,16 @@ public:
         double ttl = 15.0;     // segundos que una solicitud puede esperar un RMC libre
         std::string statsCsv;
         std::string nombre = "GT";
+        // --- escalado por CPU y leaky bucket
+        std::vector<std::string> niveles;  // VMs de RMC en orden de activación (vacío = sin escalado)
+        double umbralOut = 50.0;           // % de CPU del último nivel activo que dispara el scale-out
+        double umbralIn = 20.0;            // % de CPU bajo el cual se libera el último nivel (scale-in)
+        double sostenidoOut = 3.0;         // s que la CPU debe mantenerse alta antes de escalar
+        double sostenidoIn = 10.0;         // s que debe mantenerse baja antes de liberar
+        double enfriar = 8.0;              // s mínimos entre dos cambios de nivel
+        int cubeta = 0;                    // capacidad de la cubeta (solicitudes en espera); 0 = sin límite
+        double fuga = 0.0;                 // solicitudes/s que salen de la cubeta cuando está activa; 0 = sin tope
+        std::string lineaTiempo;           // CSV con una fila por segundo
     };
 
     explicit GestorTransacciones(const Config& c)
@@ -53,13 +78,26 @@ public:
                                    {static_cast<void*>(sockRMC), 0, ZMQ_POLLIN, 0}};
         double proximoHB = ahoraSeg() + cfg.hbMs / 1000.0;
         double ultimoResumen = ahoraSeg();
+        double proximoSegundo = ahoraSeg() + 1.0;
+        tInicio = ahoraSeg();
+        if (!cfg.niveles.empty()) {
+            std::string s;
+            for (const std::string& n : cfg.niveles) s += (s.empty() ? "" : " -> ") + n;
+            logLinea(cfg.nombre, "escalado por CPU: niveles " + s + " (out>=" + fmt0(cfg.umbralOut) + "%, in<" +
+                                     fmt0(cfg.umbralIn) + "%)" +
+                                     (cfg.cubeta > 0 ? "; leaky bucket cubeta=" + std::to_string(cfg.cubeta) +
+                                                           " fuga=" + fmt0(cfg.fuga) + "/s"
+                                                     : ""));
+        }
         long vistoAntes = 0;
         while (!g_parar) {
             if (g_volcar) {
                 g_volcar = 0;
                 volcarEstadisticas(true);
             }
-            int rc = zmq_poll(items, 2, cfg.hbMs / 5 > 0 ? cfg.hbMs / 5 : 1);
+            int espera = cfg.hbMs / 5 > 0 ? cfg.hbMs / 5 : 1;
+            if (cubetaActiva && cfg.fuga > 0 && !cola.empty()) espera = 1;  // el goteo necesita reloj fino
+            int rc = zmq_poll(items, 2, espera);
             if (rc > 0) {
                 if (items[0].revents & ZMQ_POLLIN) atenderCliente();
                 if (items[1].revents & ZMQ_POLLIN) atenderRMC();
@@ -68,6 +106,10 @@ public:
             if (ahora >= proximoHB) {
                 proximoHB = ahora + cfg.hbMs / 1000.0;
                 latir(ahora);
+            }
+            if (ahora >= proximoSegundo) {
+                proximoSegundo = ahora + 1.0;
+                cadaSegundo(ahora);
             }
             despachar(ahora);
             if (ahora - ultimoResumen >= 10.0) {
@@ -97,6 +139,9 @@ private:
         bool libre = false;
         unsigned long corr = 0;  // solicitud en curso (0 = ninguna)
         long despachadas = 0;
+        int nivel = -1;          // posición de su VM en --escalar (-1 = no administrada: siempre activa)
+        double cpu = 0;          // CPU del nodo informada en el último heartbeat (%)
+        double cpuT = 0;         // cuándo la informó
     };
 
     // ---------------------------------------------------------------- clientes --
@@ -133,6 +178,15 @@ private:
             logOp(cfg.nombre, describir(m) + " -> ACK inmediato, enviado a Cancelaciones");
             return;
         }
+        // leaky bucket: con la cubeta activa y llena, la solicitud se rechaza ya (no espera ni se reintenta)
+        if (cubetaActiva && cfg.cubeta > 0 && static_cast<int>(cola.size()) >= cfg.cubeta) {
+            Mensaje r = m;
+            r.resultado = Estado::SOBRECARGA;
+            responderCliente(identidad, r);
+            ++sobrecargas;
+            ++sobrecargasSeg;
+            return;
+        }
         // canal síncrono: se encola hasta que haya un RMC libre
         unsigned long corr = ++secuencia;
         double ahora = ahoraSeg();
@@ -157,6 +211,7 @@ private:
         if (it == trabajadores.end()) {  // RMC nuevo (o uno que había sido dado por caído)
             Trabajador t;
             t.vm = id.substr(0, id.find('/'));
+            t.nivel = nivelDe(t.vm);
             it = trabajadores.emplace(id, t).first;
             marcarLibre(id, it->second);
             logLinea(cfg.nombre, "RMC registrado: " + id + " (" + std::to_string(trabajadores.size()) +
@@ -164,6 +219,13 @@ private:
         }
         Trabajador& t = it->second;
         t.expira = ahora + cfg.hbMs * cfg.liveness / 1000.0;
+        if ((cmd == CMD_HB || cmd == CMD_READY) && f.size() >= 3) {  // CPU del nodo del RMC
+            try {
+                t.cpu = std::stod(f[2]);
+                t.cpuT = ahora;
+            } catch (...) {
+            }
+        }
 
         if (cmd == CMD_READY) {
             if (t.corr != 0) {  // el RMC se reinició y perdió lo que tenía en curso
@@ -183,6 +245,7 @@ private:
                 Mensaje r;
                 if (!deserializar(f[3], r)) r.resultado = Estado::ERROR;
                 responderCliente(p->second.identidad, r);
+                ++respondidasSeg;
                 contar(p->second.tipo, r.resultado);
                 char ms[32];
                 std::snprintf(ms, sizeof ms, "%.1f ms", (ahora - p->second.t0) * 1000.0);
@@ -205,20 +268,29 @@ private:
         }
     }
 
-    // Reparte las solicitudes en cola entre los RMC libres (el que lleva más tiempo sin trabajar).
+    // Reparte las solicitudes en cola entre los RMC libres de los niveles activos (el que lleva más tiempo sin
+    // trabajar primero). Con la cubeta activa y --fuga, el reparto sale a ritmo constante (leaky bucket).
     void despachar(double ahora) {
+        const bool gotea = cubetaActiva && cfg.fuga > 0;
+        fichas = gotea ? std::min(2.0, fichas + (ahora - tFichas) * cfg.fuga) : 1.0;
+        tFichas = ahora;
         while (!cola.empty()) {
+            if (gotea && fichas < 1.0) break;
             std::string wid;
             bool hallado = false;
-            while (!libres.empty()) {
-                std::string id = libres.front();
-                libres.pop_front();
-                auto it = trabajadores.find(id);
-                if (it != trabajadores.end() && it->second.libre) {
-                    wid = id;
+            for (auto it = libres.begin(); it != libres.end();) {
+                auto w = trabajadores.find(*it);
+                if (w == trabajadores.end() || !w->second.libre) {  // ya no está libre o se dio por caído
+                    it = libres.erase(it);
+                    continue;
+                }
+                if (elegible(w->second)) {
+                    wid = *it;
+                    libres.erase(it);
                     hallado = true;
                     break;
                 }
+                ++it;  // su nivel no está activo: queda en espera
             }
             if (!hallado) break;
             unsigned long corr = cola.front();
@@ -244,6 +316,8 @@ private:
             t.corr = corr;
             ++t.despachadas;
             ++repartoVM[t.vm];
+            ++despSeg[t.nivel >= 0 ? static_cast<size_t>(t.nivel) : cfg.niveles.size()];
+            if (gotea) fichas -= 1.0;
             p->second.trabajador = wid;
         }
     }
@@ -270,6 +344,148 @@ private:
             if (ahora - it->second.t0 > 60.0) it = pendientes.erase(it);
             else ++it;
         }
+    }
+
+    // ------------------------------------------------ escalado por CPU y cubeta --
+    static std::string fmt0(double v) {
+        char b[24];
+        std::snprintf(b, sizeof b, "%.0f", v);
+        return b;
+    }
+
+    int nivelDe(const std::string& vm) const {
+        for (size_t i = 0; i < cfg.niveles.size(); ++i)
+            if (cfg.niveles[i] == vm) return static_cast<int>(i);
+        return -1;
+    }
+
+    // ¿Este RMC recibe trabajo ahora? Sí si su VM no está administrada o su nivel está activo.
+    bool elegible(const Trabajador& t) const { return t.nivel < 0 || t.nivel < activos; }
+
+    // CPU del nivel n (la mayor informada por sus RMC en los últimos 4 s). hay = tiene RMC registrados.
+    double cpuNivel(int n, bool& hay, double ahora) const {
+        double c = 0;
+        hay = false;
+        for (const auto& kv : trabajadores) {
+            if (kv.second.nivel != n) continue;
+            hay = true;
+            if (ahora - kv.second.cpuT <= 4.0 && kv.second.cpu > c) c = kv.second.cpu;
+        }
+        return c;
+    }
+
+    // Se evalúa una vez por segundo. Ver la cabecera para las reglas.
+    void evaluarEscala(double ahora) {
+        const int K = static_cast<int>(cfg.niveles.size());
+        if (K == 0) return;
+        int disp = 0;  // niveles consecutivos con RMC registrados
+        bool hay = false;
+        while (disp < K) {
+            cpuNivel(disp, hay, ahora);
+            if (!hay) break;
+            ++disp;
+        }
+        // Tolerancia a fallas: si el primer nivel se quedó sin RMC, se activa el primero que sí tenga.
+        int primero = 0;
+        while (primero < K) {
+            cpuNivel(primero, hay, ahora);
+            if (hay) break;
+            ++primero;
+        }
+        if (primero < K && activos < primero + 1) activos = primero + 1;
+        if (disp > 0 && activos > disp) activos = std::max(1, disp);  // se cayó una VM de las activas
+        if (activos < 1) activos = 1;
+
+        const int ultimo = activos - 1;
+        double c = cpuNivel(ultimo, hay, ahora);
+        double cPrev = 0;
+        if (ultimo > 0) cPrev = cpuNivel(ultimo - 1, hay, ahora);
+        bool enfriado = ahora - tCambio >= cfg.enfriar;
+        if (c >= cfg.umbralOut) {
+            if (tAlto == 0.0) tAlto = ahora;
+        } else {
+            tAlto = 0.0;
+        }
+        if (c < cfg.umbralIn) {
+            if (tBajo == 0.0) tBajo = ahora;
+        } else {
+            tBajo = 0.0;
+        }
+        bool altoSostenido = tAlto > 0.0 && ahora - tAlto >= cfg.sostenidoOut;
+
+        if (activos < disp) {
+            if (altoSostenido && enfriado) {  // scale-out
+                ++activos;
+                tCambio = ahora;
+                tAlto = tBajo = 0.0;
+                logLinea(cfg.nombre, "ESCALA-OUT: CPU de '" + cfg.niveles[ultimo] + "' = " + fmt0(c) + "% >= " +
+                                         fmt0(cfg.umbralOut) + "% -> se activa '" + cfg.niveles[activos - 1] +
+                                         "' (" + std::to_string(activos) + "/" + std::to_string(K) + " niveles)");
+            }
+        } else if (cfg.cubeta > 0 && !cubetaActiva && altoSostenido) {  // ya no hay más VMs: entra la cubeta
+            cubetaActiva = true;
+            tCubetaBaja = 0.0;
+            fichas = 1.0;
+            logLinea(cfg.nombre, "CUBETA ACTIVA: todos los niveles disponibles (" + std::to_string(activos) +
+                                     ") están al límite (CPU '" + cfg.niveles[ultimo] + "' = " + fmt0(c) +
+                                     "%); salida " + (cfg.fuga > 0 ? fmt0(cfg.fuga) + "/s" : std::string("libre")) +
+                                     ", capacidad " + std::to_string(cfg.cubeta));
+        }
+        if (cubetaActiva) {  // la cubeta se libera cuando hay holgura (o se activó otro nivel)
+            if (c < cfg.umbralOut - 10.0 || activos < disp) {
+                if (tCubetaBaja == 0.0) tCubetaBaja = ahora;
+                if (ahora - tCubetaBaja >= cfg.sostenidoOut) {
+                    cubetaActiva = false;
+                    tCubetaBaja = 0.0;
+                    logLinea(cfg.nombre, "CUBETA LIBERADA: CPU de '" + cfg.niveles[ultimo] + "' = " + fmt0(c) + "%");
+                }
+            } else {
+                tCubetaBaja = 0.0;
+            }
+        }
+        // scale-in: el último nivel casi no trabaja y el anterior aguantaría la carga con holgura
+        if (activos > 1 && !cubetaActiva && tBajo > 0.0 && ahora - tBajo >= cfg.sostenidoIn && enfriado &&
+            cPrev < cfg.umbralOut - 10.0) {
+            logLinea(cfg.nombre, "ESCALA-IN: CPU de '" + cfg.niveles[ultimo] + "' = " + fmt0(c) + "% < " +
+                                     fmt0(cfg.umbralIn) + "% -> se libera (" + std::to_string(activos - 1) + "/" +
+                                     std::to_string(K) + " niveles)");
+            --activos;
+            tCambio = ahora;
+            tAlto = tBajo = 0.0;
+        }
+    }
+
+    // Una vez por segundo: evalúa el escalado y escribe la línea de tiempo.
+    void cadaSegundo(double ahora) {
+        evaluarEscala(ahora);
+        if (cfg.lineaTiempo.empty()) return;
+        if (!tl.is_open()) {
+            bool existe = std::ifstream(cfg.lineaTiempo).good();
+            tl.open(cfg.lineaTiempo, std::ios::app);
+            if (!existe) {
+                tl << "t_s,hora,niveles_activos,cubeta,cola,respondidas,sobrecarga";
+                for (const std::string& n : cfg.niveles) tl << ",cpu_" << n;
+                for (const std::string& n : cfg.niveles) tl << ",desp_" << n;
+                tl << ",desp_otros\n";
+            }
+        }
+        char hora[16];
+        std::time_t tt = std::time(nullptr);
+        std::strftime(hora, sizeof hora, "%H:%M:%S", std::localtime(&tt));
+        char b[96];
+        std::snprintf(b, sizeof b, "%.0f,%s,%d,%d,%zu,%ld,%ld", ahora - tInicio, hora, activos,
+                      cubetaActiva ? 1 : 0, cola.size(), respondidasSeg, sobrecargasSeg);
+        tl << b;
+        bool hay = false;
+        for (size_t i = 0; i < cfg.niveles.size(); ++i) {
+            std::snprintf(b, sizeof b, ",%.1f", cpuNivel(static_cast<int>(i), hay, ahora));
+            tl << b;
+        }
+        for (size_t i = 0; i <= cfg.niveles.size(); ++i) tl << ',' << despSeg[i];
+        tl << '\n';
+        tl.flush();
+        respondidasSeg = sobrecargasSeg = 0;
+        for (long& v : despSeg) v = 0;
     }
 
     // La solicitud vuelve al frente de la cola. Es seguro repetirla: Persistencia reconoce
@@ -396,16 +612,19 @@ private:
             }
             logLinea("GT-STATS", "reparto entre VMs: " + s);
         }
-        if (invalidas || reasignadas || expiradas)
+        if (invalidas || reasignadas || expiradas || sobrecargas)
             logLinea("GT-STATS", "inválidas=" + std::to_string(invalidas) + " reasignadas=" +
                                      std::to_string(reasignadas) + " expiradas=" +
-                                     std::to_string(expiradas));
+                                     std::to_string(expiradas) + " sobrecarga=" + std::to_string(sobrecargas));
+        if (!cfg.niveles.empty())
+            logLinea("GT-STATS", "niveles activos=" + std::to_string(activos) + "/" +
+                                     std::to_string(cfg.niveles.size()) + (cubetaActiva ? "  CUBETA ACTIVA" : ""));
         if (reiniciar) {
             for (auto& fila : contadores)
                 for (long& v : fila) v = 0;
             repartoVM.clear();
             for (auto& kv : trabajadores) kv.second.despachadas = 0;
-            invalidas = reasignadas = expiradas = 0;
+            invalidas = reasignadas = expiradas = sobrecargas = 0;
             tPrimera = tUltima = 0.0;
         }
     }
@@ -424,8 +643,17 @@ private:
     std::map<std::string, long> repartoVM;
     unsigned long secuencia = 0;
     long contadores[4][3] = {};
-    long invalidas = 0, reasignadas = 0, expiradas = 0;
+    long invalidas = 0, reasignadas = 0, expiradas = 0, sobrecargas = 0;
     double tPrimera = 0.0, tUltima = 0.0;
+    // escalado y cubeta
+    int activos = 1;               // niveles activos
+    bool cubetaActiva = false;
+    double tAlto = 0.0, tBajo = 0.0, tCambio = -1e9, tCubetaBaja = 0.0;
+    double fichas = 1.0, tFichas = 0.0;
+    double tInicio = 0.0;
+    long respondidasSeg = 0, sobrecargasSeg = 0;
+    std::vector<long> despSeg = std::vector<long>(64, 0);  // despachos del último segundo por nivel (+ otros)
+    std::ofstream tl;
 };
 
 int main(int argc, char** argv) {
@@ -440,6 +668,17 @@ int main(int argc, char** argv) {
     c.ttl = argDbl(argc, argv, "--ttl", c.ttl);
     c.statsCsv = argStr(argc, argv, "--stats-csv", "");
     c.nombre = argStr(argc, argv, "--nombre", c.nombre);
+    for (const std::string& n : dividir(argStr(argc, argv, "--escalar", ""), ','))
+        if (!n.empty()) c.niveles.push_back(n);
+    if (c.niveles.size() > 60) c.niveles.resize(60);
+    c.umbralOut = argDbl(argc, argv, "--umbral-out", c.umbralOut);
+    c.umbralIn = argDbl(argc, argv, "--umbral-in", c.umbralIn);
+    c.sostenidoOut = argDbl(argc, argv, "--sostenido-out", c.sostenidoOut);
+    c.sostenidoIn = argDbl(argc, argv, "--sostenido-in", c.sostenidoIn);
+    c.enfriar = argDbl(argc, argv, "--enfriar", c.enfriar);
+    c.cubeta = argInt(argc, argv, "--cubeta", c.cubeta);
+    c.fuga = argDbl(argc, argv, "--fuga", c.fuga);
+    c.lineaTiempo = argStr(argc, argv, "--linea-tiempo", "");
     try {
         GestorTransacciones gt(c);
         gt.iniciar();

@@ -14,6 +14,7 @@ notificación al cliente cuando se efectúa en la BD.
 | **RMC** (réplicas en VM4 y VM5, varios hilos) | El GT reparte cada solicitud al RMC libre que lleva más tiempo ocioso (LRU) → trabajo equitativo entre las 2 VMs (el GT imprime el reparto por VM) | El RMC envía *heartbeats*; si calla, el GT lo da por caído y **reasigna** la solicitud en curso a otro RMC. Con `scripts/supervisor.sh` un proceso nuevo lo sustituye y se re-registra solo |
 | **GT** (principal en VM2 + relevo en VM4) | Un solo GT atiende a muchos clientes (ROUTER asíncrono) | El relevo es el mismo binario; los RMC se registran en ambos. Si el principal cae, el cliente (*Lazy Pirate*) agota el tiempo, reintenta con el **mismo idMensaje** en el relevo y sigue |
 | **Persistencia** (VM3) | N hilos, cada uno con su conexión a PostgreSQL (ROUTER/DEALER interno) | Cada transacción mutante guarda `(idCliente, idMensaje)` en la tabla `transaccion`: un reintento o reasignación **no duplica** la reserva, devuelve el resultado guardado |
+| **Escalado por CPU + leaky bucket** (GT) | Scale-out / scale-in: el GT activa VM4 y VM5 cuando la VM anterior pasa del 50 % de CPU y las libera al bajar la carga (sección *Escalado automático*) | Con todas las VMs al límite, la cubeta acota la cola y rechaza el exceso de inmediato (`SOBRECARGA`): protege la latencia |
 | **Generador de carga** | Se puede dividir entre 2 VMs (`--vm-indice 0/1 --vm-total 2`); cada VM atiende la mitad de los clientes | — |
 
 ## Estructura
@@ -26,12 +27,15 @@ srb/
 ├── DISENO_Y_PRUEBAS.txt           diseño final y protocolo de pruebas (para el informe)
 ├── ejemplos/caso_ejemplo.txt      operaciones de ejemplo para bin/cliente ("caso del profesor")
 ├── analisis/analisis.py           Tabla 1 y gráficos (pandas + matplotlib) a partir de los CSV
+├── analisis/escalamiento.py       gráfico y resumen de la prueba de escalamiento (scale-out/in + leaky bucket)
 ├── scripts/
-│   ├── pruebas_automaticas.sh     batería completa (52 comprobaciones) en UNA máquina
+│   ├── pruebas_automaticas.sh     batería completa en UNA máquina (incluye pruebas_escalado.sh)
+│   ├── pruebas_escalado.sh        escalado por CPU y leaky bucket con CPU simulada (24 comprobaciones)
 │   ├── prueba_local.sh            demostración rápida de toda la arquitectura en una máquina
 │   ├── tabla1.sh                  corridas de la Tabla 1 (base/escalable; 3, 5, 8 clientes; N repeticiones)
 │   ├── prueba_empirica.sh         DESDE VM1: arranca la topología por ssh, genera carga y mide CPU en cada nodo
 │   ├── muestreo_cpu.sh            lo usa el anterior en cada VM (CPU por componente)
+│   ├── cpu_serie.sh               CPU de la máquina cada segundo (la usa 'escalamiento' en VM1 y en la BD)
 │   ├── quien_soy.sh               en cada VM: dice qué máquina es y qué rol cumple
 │   ├── actualizar_vms.sh          git pull + compilar en todas las VMs (desde VM1)
 │   ├── vms.conf.ejemplo           IP de las VMs (copiar a vms.conf)
@@ -238,6 +242,41 @@ antes de cada uno) y, para cada uno, imprime tiempos y TPM, CPU por componente y
 componente que limita. Los CSV quedan en `resultados_procedimientos/`. En el perfil de cancelación el costo por
 transacción es por pareja reserva + cancelación (la cancelación es asíncrona: el cliente no mide su tiempo).
 
+## Escalado automático por CPU (scale-out / scale-in) y leaky bucket
+
+El GT decide cuántas VMs de RMC reciben trabajo según la **CPU de cada VM**, que cada RMC informa en su heartbeat
+(`/proc/stat`, % de todos los núcleos). Las VMs se declaran en orden de activación con `--escalar base,vm4,vm5` (el nombre es
+el `--nombre` del RMC de cada VM). Todos los RMC están arrancados y registrados desde el principio; "activar" una VM es que el
+GT empiece a repartirle solicitudes y "liberarla" es dejar de hacerlo (termina lo que tiene y queda en espera, sin consumir).
+
+| Evento | Regla (valores por defecto) |
+|---|---|
+| **Scale-out** | la CPU del **último nivel activo** se mantiene ≥ `--umbral-out` (**50 %**) durante `--sostenido-out` (3 s) → se activa el siguiente nivel. Con 2 o más niveles activos el reparto entre ellos es parejo (el RMC libre que lleva más tiempo ocioso) |
+| **Scale-in** | la CPU del último nivel activo queda < `--umbral-in` (20 %) durante `--sostenido-in` (10 s) **y** el nivel anterior tiene holgura (< umbral-out − 10) → se libera el último. Si quitar una VM devolvería la anterior al umbral, no se libera |
+| **Anti-oscilación** | umbrales distintos de entrada y salida + tiempo sostenido + `--enfriar` (8 s) mínimos entre dos cambios |
+| **Leaky bucket** | cuando ya están activos todos los niveles disponibles y el último sigue ≥ umbral-out, la cubeta (cola de espera acotada a `--cubeta N` solicitudes) se vacía hacia los RMC; si llega una solicitud con la cubeta llena se responde de inmediato `SOBRECARGA` (el cliente no espera ni reintenta, y espera `--backoff-ms` antes de pedir de nuevo). Con `--fuga R` la salida además se limita a R solicitudes/s. Se libera cuando la CPU baja de umbral-out − 10 |
+| **Tolerancia a fallas** | si el primer nivel se queda sin RMC (cae la VM), se activa automáticamente el primero que tenga; si cae una VM activa, el GT sigue con las demás. Las cancelaciones no pasan por la cubeta |
+
+Todo es opcional: sin `--escalar` el GT se comporta como antes (reparto parejo entre todos los RMC).
+
+```bash
+# Demostración desde VM1 (VM2 = BD, VM3 = GT + RMC "base", VM4 y VM5 = RMC "vm4" y "vm5" en espera):
+scripts/prueba_empirica.sh verificar
+scripts/prueba_empirica.sh escalamiento | tee escalamiento.txt          # rampa de clientes 4->160->4 (~5 min)
+# resultados_escalamiento/escalamiento.png  y  escalamiento_resumen.md
+UMBRAL_OUT=30 CUBETA=40 FUGA=800 scripts/prueba_empirica.sh escalamiento   # variantes (ver cabecera del script)
+```
+
+El script arranca la topología, sube y baja los clientes en pasos (`PASOS="4 12 24 48 96 160 96 48 12 4"`, `PASO_S=25`
+s cada uno) y registra, segundo a segundo, los niveles activos, la CPU de cada VM, el reparto, la cola y los rechazos
+(`escala_gt.csv`); `analisis/escalamiento.py` lo convierte en un gráfico de 4 paneles. **Si VM3 nunca llega al 50 %** (la
+BD suele saturarse antes: ver sección 11 de `DISENO_Y_PRUEBAS.txt`), baje el umbral (`UMBRAL_OUT=30`) o suba la carga
+(`PASOS`); el gráfico muestra la CPU real de cada VM para decidirlo.
+
+Pruebas automáticas (CPU simulada con `--cpu-simulada`, determinista): `scripts/pruebas_escalado.sh` (24 comprobaciones:
+scale-out base→vm4→vm5, scale-in en orden inverso, reparto parejo con 3 niveles, la cubeta limita a la fuga configurada,
+la cola nunca pasa de la capacidad, lo rechazado no deja rastro en la BD).
+
 ## Demostración de las fallas (sustentación)
 
 Con el generador corriendo (`--rpm 0` para ver el efecto):
@@ -295,13 +334,16 @@ python3 analisis/analisis.py 'resultados/*muestras*.csv' --salida resultados
   `--dobles 20` `--asientos 100` `--volcar-cada SEG` `--silencioso`
 - **gestor:** `--bind tcp://*:5555` `--bind-rmc tcp://*:5556` `--cancel tcp://host:5557` `--hb-ms 500`
   `--liveness 4` `--ttl 15` `--stats-csv archivo` `--nombre GT1` `--silencioso`
+  Escalado y cubeta (opcionales): `--escalar base,vm4,vm5` `--umbral-out 50` `--umbral-in 20` `--sostenido-out 3`
+  `--sostenido-in 10` `--enfriar 8` `--cubeta N` `--fuga R` `--linea-tiempo archivo.csv`
 - **rmc:** `--gt tcp://h:5556[,tcp://h2:6556]` `--persistencia tcp://h:5559` `--hilos 2` `--nombre vm4`
-  `--hb-ms 500` `--liveness 4` `--timeout-ms 3000` `--silencioso`
+  `--hb-ms 500` `--liveness 4` `--timeout-ms 3000` `--cpu-simulada archivo` `--silencioso`
 - **cancelaciones:** `--bind-pull tcp://*:5557` `--bind-pub tcp://*:5558` `--persistencia tcp://h:5559` `--silencioso`
 - **generador:** `--gt tcp://a:5555[,tcp://b:6555]` `--notif tcp://h:5558` `--clientes N` `--solo-consulta K`
   `--rpm N` (0 = sin pausa; el enunciado exige ≥ 20) `--duracion SEG` `--calentamiento SEG` `--timeout-ms 4000`
   `--reintentos 3` `--pct-consulta 40 --pct-reserva 40 --pct-modificar 20 --pct-cancelar 0` (suman 100)
   `--max-asientos 4` `--eventos 50 --dobles 20 --mes 202611` `--semilla` `--vm-indice I --vm-total T`
+  `--backoff-ms 50` (espera tras un rechazo por SOBRECARGA)
   `--arquitectura base|escalable --repeticion R` `--csv resumen.csv` `--muestras muestras.csv`
 - **cliente:** `archivo.txt` `--gt` `--notif` `--todo` `--esperar-notif MS` `--pausa-ms MS`
 
@@ -325,4 +367,7 @@ idOcurrencia|mes|numAsientos|idReserva|fechaNueva|numAsientosNuevo|tsEnvio|resul
   hasta que se relance (el supervisor lo reinicia si solo cae el proceso).
 - Las cancelaciones aceptadas y aún no efectuadas viven en la cola del GT → PULL; si el proceso GT muere en ese instante
   pueden perderse (el cliente ya recibió el ACK).
+- El escalado es lógico: las réplicas de VM4/VM5 ya están arrancadas y el GT las activa o libera; no arranca ni apaga
+  máquinas. Cada GT (principal y relevo) lleva su propio estado de escalado. La CPU que se mide es la del nodo completo.
+- Si la BD es el límite, activar más VMs de RMC no sube el rendimiento (solo añade concurrencia); la cubeta protege la latencia.
 - Todo el sistema se verificó en una sola máquina; el despliegue real en 5 VMs se prueba con los comandos de arriba.

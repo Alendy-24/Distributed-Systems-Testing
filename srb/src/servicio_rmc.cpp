@@ -8,7 +8,10 @@
 //
 // Uso: ./rmc --gt tcp://IP_GT:5556[,tcp://IP_GT_RELEVO:5556] --persistencia tcp://IP_BD:5559
 //            [--hilos 2] [--nombre vm4] [--hb-ms 500] [--liveness 4] [--timeout-ms 3000]
-//            [--silencioso]
+//            [--cpu-simulada archivo] [--silencioso]
+// Cada READY/heartbeat lleva la CPU del nodo (% de todos sus núcleos): el GT la usa para decidir cuándo
+// activar la siguiente VM (scale-out) y cuándo liberarla (scale-in). --cpu-simulada lee ese valor de un
+// archivo (para ensayar el escalado sin generar carga real).
 #include <thread>
 
 #include "common.hpp"
@@ -23,13 +26,15 @@ struct ConfigRMC {
     int hbMs = 500;
     int liveness = 4;
     int timeoutMs = 3000;
+    std::string cpuSimulada;
 };
 
 class ServicioRMC {
 public:
-    ServicioRMC(zmq::context_t& ctx, const ConfigRMC& cfg, int idx)
+    ServicioRMC(zmq::context_t& ctx, const ConfigRMC& cfg, int idx, MedidorCPU& cpu)
         : ctx_(ctx),
           cfg_(cfg),
+          cpu_(cpu),
           persistencia(ctx, cfg.persistencia, cfg.timeoutMs),
           idRMC(cfg.nombre + "/h" + std::to_string(idx) + "#" + std::to_string(getpid())),
           tag("RMC[" + cfg.nombre + "/h" + std::to_string(idx) + "]") {}
@@ -58,7 +63,7 @@ public:
                 }
                 if (ahora >= enlaces[i].proximoHB) {
                     enlaces[i].proximoHB = ahora + cfg_.hbMs / 1000.0;
-                    enviarMultipart(enlaces[i].sock, {CMD_HB}, true);
+                    enviarMultipart(enlaces[i].sock, {CMD_HB, cpuTexto()}, true);
                 }
                 if (ahora - enlaces[i].ultimoRx > silencioMax) {
                     if (!enlaces[i].caido) {
@@ -146,6 +151,12 @@ private:
         bool caido = false;
     };
 
+    std::string cpuTexto() {
+        char b[16];
+        std::snprintf(b, sizeof b, "%.1f", cpu_.porcentaje());
+        return b;
+    }
+
     Mensaje fallo(const Mensaje& m, const char* donde) {
         Mensaje r = m;
         r.resultado = Estado::ERROR;
@@ -162,7 +173,7 @@ private:
         double ahora = ahoraSeg();
         e.ultimoRx = ahora;
         e.proximoHB = ahora + cfg_.hbMs / 1000.0;
-        enviarMultipart(e.sock, {CMD_READY}, true);
+        enviarMultipart(e.sock, {CMD_READY, cpuTexto()}, true);
         if (primera) logLinea(tag, "registrado en el GT " + cfg_.gts[i]);
     }
 
@@ -187,6 +198,7 @@ private:
 
     zmq::context_t& ctx_;
     ConfigRMC cfg_;
+    MedidorCPU& cpu_;
     EnlaceREQ persistencia;
     std::string idRMC;
     std::string tag;
@@ -205,13 +217,15 @@ int main(int argc, char** argv) {
     c.hbMs = argInt(argc, argv, "--hb-ms", c.hbMs);
     c.liveness = argInt(argc, argv, "--liveness", c.liveness);
     c.timeoutMs = argInt(argc, argv, "--timeout-ms", c.timeoutMs);
+    c.cpuSimulada = argStr(argc, argv, "--cpu-simulada", "");
     try {
         zmq::context_t ctx(1);
+        MedidorCPU cpu(c.cpuSimulada);
         std::vector<std::thread> hilos;
         for (int i = 0; i < c.hilos; ++i)
-            hilos.emplace_back([&ctx, &c, i]() {
+            hilos.emplace_back([&ctx, &c, &cpu, i]() {
                 try {
-                    ServicioRMC rmc(ctx, c, i);
+                    ServicioRMC rmc(ctx, c, i, cpu);
                     rmc.iniciar();
                 } catch (const std::exception& e) {
                     std::fprintf(stderr, "Hilo RMC %d terminó: %s\n", i, e.what());

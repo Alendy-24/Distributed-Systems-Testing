@@ -14,7 +14,7 @@
 //        [--vm-indice 0 --vm-total 2]
 //        [--pct-consulta 40 --pct-reserva 40 --pct-modificar 20 --pct-cancelar 0]
 //        [--mes 202611] [--eventos 50] [--dobles 20] [--max-asientos 4]
-//        [--calentamiento 5] [--timeout-ms 4000] [--reintentos 3] [--semilla 1]
+//        [--calentamiento 5] [--timeout-ms 4000] [--reintentos 3] [--semilla 1] [--backoff-ms 50]
 //        [--arquitectura base|escalable] [--repeticion 1]
 //        [--csv resumen.csv] [--muestras muestras.csv]
 //   --rpm 0  = sin pausa entre solicitudes (máxima carga).
@@ -44,6 +44,11 @@ public:
     void registrar(TipoOperacion tipo, double ms, double t, Estado e, int intentos, int cambios) {
         std::lock_guard<std::mutex> g(mtx);
         int i = idx(tipo);
+        if (e == Estado::SOBRECARGA) {  // rechazada de inmediato por la cubeta del GT: no entra en los tiempos
+            sobrecargas[i]++;
+            muestras.push_back({static_cast<int>(tipo), ms, t, static_cast<int>(e), intentos});
+            return;
+        }
         tiempos[i].push_back(ms);
         resultados[i][static_cast<int>(e)]++;
         if (intentos > 1) reintentos++;
@@ -54,7 +59,7 @@ public:
         std::lock_guard<std::mutex> g(mtx);
         timeouts[idx(tipo)]++;  // aparte, para no distorsionar los promedios
         failovers += cambios;
-        muestras.push_back({static_cast<int>(tipo), -1.0, t, 3, intentos});
+        muestras.push_back({static_cast<int>(tipo), -1.0, t, -1, intentos});  // resultado -1 = timeout
     }
     void registrarCancelacion() { std::lock_guard<std::mutex> g(mtx); cancelaciones++; }
     void registrarNotificacion() { std::lock_guard<std::mutex> g(mtx); notificaciones++; }
@@ -102,6 +107,10 @@ public:
         return resultados[idx(t)][static_cast<int>(e)];
     }
     long getTimeouts(TipoOperacion t) const { std::lock_guard<std::mutex> g(mtx); return timeouts[idx(t)]; }
+    long getSobrecargas() const {
+        std::lock_guard<std::mutex> g(mtx);
+        return sobrecargas[0] + sobrecargas[1] + sobrecargas[2];
+    }
     long getReintentos() const { std::lock_guard<std::mutex> g(mtx); return reintentos; }
     long getFailovers() const { std::lock_guard<std::mutex> g(mtx); return failovers; }
     long getCancelaciones() const { std::lock_guard<std::mutex> g(mtx); return cancelaciones; }
@@ -116,8 +125,9 @@ private:
     }
     mutable std::mutex mtx;
     std::vector<double> tiempos[3];  // consulta, reserva, modificación
-    long resultados[3][3] = {};
+    long resultados[3][4] = {};
     long timeouts[3] = {0, 0, 0};
+    long sobrecargas[3] = {0, 0, 0};
     long reintentos = 0, failovers = 0, cancelaciones = 0, notificaciones = 0;
     long reservasExitoTotal = 0, reservasTimeoutTotal = 0;
     std::vector<Muestra> muestras;
@@ -164,6 +174,7 @@ struct Parametros {
     std::string notif, arquitectura, csv, muestras;
     int clientes, soloConsulta, rpm, duracion, calentamiento, timeoutMs, reintentos, semilla;
     int pctConsulta, pctReserva, pctModificar, pctCancelar;
+    int backoffMs = 50;  // espera tras un rechazo por SOBRECARGA
     int mes, eventos, dobles, maxAsientos, vmIndice, vmTotal, repeticion;
 };
 
@@ -304,6 +315,9 @@ private:
 
             Mensaje nota;
             while (cliente.recibirNotificacion(nota, 0)) metricas.registrarNotificacion();
+            // el GT rechazó por sobrecarga: un cliente educado espera un poco antes de volver a pedir
+            if (ok && r.resultado == Estado::SOBRECARGA && p_.backoffMs > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(p_.backoffMs));
 
             double restante = intervalo - (ahoraSeg() - inicioIter);
             if (restante > 0) std::this_thread::sleep_for(std::chrono::duration<double>(restante));
@@ -346,7 +360,8 @@ private:
                               std::to_string(metricas.getReintentos()) + " cambios_de_GT=" +
                               std::to_string(metricas.getFailovers()) + " reservas_confirmadas=" +
                               std::to_string(metricas.getReservasExitoTotal()) + " reservas_sin_respuesta=" +
-                              std::to_string(metricas.getReservasTimeoutTotal()));
+                              std::to_string(metricas.getReservasTimeoutTotal()) + " sobrecarga=" +
+                              std::to_string(metricas.getSobrecargas()));
         if (p_.pctCancelar > 0)
             logLinea("CARGA", "cancelaciones enviadas=" + std::to_string(metricas.getCancelaciones()) +
                                   " notificaciones recibidas=" +
@@ -360,7 +375,7 @@ private:
             for (const Muestra& s : metricas.getMuestras()) {
                 f << p_.arquitectura << ',' << p_.repeticion << ',' << p_.clientes << ',' << p_.vmIndice
                   << ',' << nombre(static_cast<TipoOperacion>(s.tipo)) << ',' << s.ms << ',' << s.t << ','
-                  << (s.resultado == 3 ? "TIMEOUT" : nombre(static_cast<Estado>(s.resultado))) << ','
+                  << (s.resultado < 0 ? "TIMEOUT" : nombre(static_cast<Estado>(s.resultado))) << ','
                   << s.intentos << ',' << ventana << '\n';
             }
             logLinea("CARGA", "muestras agregadas a " + p_.muestras);
@@ -419,6 +434,7 @@ int main(int argc, char** argv) {
     p.pctReserva = argInt(argc, argv, "--pct-reserva", 40);
     p.pctModificar = argInt(argc, argv, "--pct-modificar", 20);
     p.pctCancelar = argInt(argc, argv, "--pct-cancelar", 0);
+    p.backoffMs = argInt(argc, argv, "--backoff-ms", p.backoffMs);
     p.mes = argInt(argc, argv, "--mes", 202611);
     p.eventos = std::max(1, argInt(argc, argv, "--eventos", 50));
     p.dobles = argInt(argc, argv, "--dobles", 20);

@@ -19,10 +19,22 @@ IP_GT=${IP_GT:-localhost}; IP_BD=${IP_BD:-localhost}; IP_VM4=${IP_VM4:-localhost
 SSH_OPTS=${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new}
 HOSTS=$(printf '%s\n' "$IP_GT" "$IP_BD" "$IP_VM4" "$IP_VM5" | awk '!v[$0]++')
 
+usuario_de() {   # por defecto USUARIO; si las VMs son cuentas distintas: USUARIO_GT/BD/VM4/VM5 en vms.conf
+    local u=$USUARIO
+    [ "$1" = "$IP_BD" ] && u=${USUARIO_BD:-$u}; [ "$1" = "$IP_GT" ] && u=${USUARIO_GT:-$u}
+    [ "$1" = "$IP_VM4" ] && u=${USUARIO_VM4:-$u}; [ "$1" = "$IP_VM5" ] && u=${USUARIO_VM5:-$u}
+    echo "$u"
+}
+ruta_de() {      # por defecto RUTA; si la carpeta difiere: RUTA_GT/BD/VM4/VM5 en vms.conf
+    local r=$RUTA
+    [ "$1" = "$IP_BD" ] && r=${RUTA_BD:-$r}; [ "$1" = "$IP_GT" ] && r=${RUTA_GT:-$r}
+    [ "$1" = "$IP_VM4" ] && r=${RUTA_VM4:-$r}; [ "$1" = "$IP_VM5" ] && r=${RUTA_VM5:-$r}
+    echo "$r"
+}
 en() {
     local ip=$1; shift
     if [ "$MODO" = "local" ]; then bash -c "cd '$RUTA' && $*"
-    else ssh $SSH_OPTS "$USUARIO@$ip" "cd '$RUTA' && $*"; fi
+    else ssh $SSH_OPTS "$(usuario_de "$ip")@$ip" "cd '$(ruta_de "$ip")' && $*"; fi
 }
 destinos() {  # binarios que necesita una VM según su rol (sin PostgreSQL salvo en la VM de la BD)
     local ip=$1 t=""
@@ -47,7 +59,7 @@ fi
 for ip in $HOSTS; do
     echo "== $ip =="
     if ! en "$ip" "git rev-parse --is-inside-work-tree" >/dev/null 2>&1; then
-        echo "   ERROR: no hay ssh o $RUTA no es un clon git en esa VM (haga allí: git clone <url> $RUTA)"; mal=1; continue
+        echo "   ERROR: no hay ssh o $(ruta_de "$ip") no es un clon git en esa VM (haga allí: git clone <url> y revise RUTA/RUTA_* en vms.conf)"; mal=1; continue
     fi
     t=$(destinos "$ip")
     salida=$(en "$ip" "git pull --ff-only 2>&1 && make $t 2>&1 | grep -E 'error|Error|undefined' ; echo \"versión: \$(cat VERSION 2>/dev/null || echo '?')  | binarios: $t\"")

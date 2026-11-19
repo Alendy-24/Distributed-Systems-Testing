@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Batería de pruebas automáticas, TODO EN UNA MÁQUINA (los procesos simulan las VMs con puertos
 # y nombres distintos). Comprueba funcionalidad, consistencia bajo concurrencia, reparto
-# equitativo entre VMs, caída de un RMC, caída del GT principal y generador repartido en 2 VMs.
+# equitativo entre VMs, caída de un RMC, caída del GT principal, generador repartido en 2 VMs y, al final,
+# el escalado por CPU y el leaky bucket (scripts/pruebas_escalado.sh).
 #
 # Uso: scripts/pruebas_automaticas.sh [segundos_por_prueba_de_carga]   (por defecto 15)
 # Requiere: make ya ejecutado, PostgreSQL con la base "srb" accesible sin contraseña.
@@ -203,6 +204,13 @@ check "$([ "$conf" = "$filas" ] && echo 1 || echo 0)" "confirmadas = filas de la
 invariantes 7000
 kill -TERM $SUP 2>/dev/null
 parar_todo
+
+echo "== 10-11. Escalado por CPU (scale-out/scale-in) y leaky bucket (scripts/pruebas_escalado.sh) =="
+scripts/pruebas_escalado.sh > "$LOG/escalado.log" 2>&1
+sed -n '/^== 10/,$p' "$LOG/escalado.log" | grep -v "^RESUMEN" | grep -v "^$" | sed 's/^== 1[01]\..*/&/'
+res=$(grep "^RESUMEN" "$LOG/escalado.log" | tail -1)
+pe=$(echo "$res" | sed -n 's/^RESUMEN: \([0-9]*\) pruebas.*/\1/p'); fe=$(echo "$res" | sed -n 's/.* \([0-9]*\) fallidas.*/\1/p')
+PASS=$((PASS + ${pe:-0})); FAIL=$((FAIL + ${fe:-1}))
 
 echo
 echo "RESUMEN: $PASS pruebas correctas, $FAIL fallidas   (logs en $LOG/)"

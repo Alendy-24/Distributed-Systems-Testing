@@ -9,6 +9,9 @@
 #   scripts/prueba_empirica.sh correr escalable          RMC en VM4+VM5, persistencia multihilo, GT de relevo
 #   scripts/prueba_empirica.sh correr elastica           arranca como "base" y a los ELASTICA_S s une VM4 y VM5
 #                                                        EN PLENA CARGA (se ve el salto de throughput)
+#   scripts/prueba_empirica.sh escalamiento             SCALE-OUT / SCALE-IN por CPU con rampa de carga: VM3 sirve sola
+#                                                        hasta el 50 % de CPU, luego se activa VM4, luego VM5; al
+#                                                        saturarse todas entra el leaky bucket; al bajar la carga se liberan
 #   scripts/prueba_empirica.sh procedimientos base|escalable
 #                                                        aísla cada procedimiento (consulta, reserva, modificación,
 #                                                        cancelación, mixto) y dice cuánta CPU gasta cada componente
@@ -21,6 +24,8 @@
 # Variables opcionales: CLIENTES="3 5 8" REPS=1 DUR=60 CAL=10 HILOS_BD=4 HILOS_RMC=2 ASIENTOS=5000
 #                       ELASTICA_S=25 SALIDA=resultados_empiricos MODO=local (ensayo en una sola máquina)
 #                       CLIENTES_PROC=8 (clientes en 'procedimientos')  SALIDA_PROC=resultados_procedimientos
+#                       Escalamiento: PASOS="4 12 24 48 96 160 96 48 12 4" PASO_S=25 UMBRAL_OUT=50 UMBRAL_IN=20 CUBETA=60
+#                       FUGA=0 (req/s de salida de la cubeta; 0 = solo limita la cola) HILOS_ESC=4 ASIENTOS_ESC=200000
 # Etiquetas de las VMs en los informes (vms.conf): ET_GT ET_BD ET_VM4 ET_VM5 ET_GEN, p. ej. ET_BD="VM2-BD".
 # Si la capa lógica está toda en UNA VM, ponga IP_VM4 e IP_VM5 iguales a IP_GT (y ET_VM4="" ET_VM5=""):
 # 'escalable' arranca entonces el GT de relevo y las réplicas RMC en esa misma VM.
@@ -38,14 +43,31 @@ CLIENTES=${CLIENTES:-"3 5 8"}; REPS=${REPS:-1}; DUR=${DUR:-60}; CAL=${CAL:-10}
 HILOS_BD=${HILOS_BD:-4}; HILOS_RMC=${HILOS_RMC:-2}; ASIENTOS=${ASIENTOS:-5000}
 ELASTICA_S=${ELASTICA_S:-25}
 CLIENTES_PROC=${CLIENTES_PROC:-8}
+PASOS=${PASOS:-"4 12 24 48 96 160 96 48 12 4"}; PASO_S=${PASO_S:-25}
+UMBRAL_OUT=${UMBRAL_OUT:-50}; UMBRAL_IN=${UMBRAL_IN:-20}; CUBETA=${CUBETA:-60}; FUGA=${FUGA:-0}
+HILOS_ESC=${HILOS_ESC:-4}; ASIENTOS_ESC=${ASIENTOS_ESC:-200000}
 ET_GT=${ET_GT-VM2(GT)}; ET_BD=${ET_BD-VM3(BD)}; ET_VM4=${ET_VM4-VM4}; ET_VM5=${ET_VM5-VM5}; ET_GEN=${ET_GEN-VM1(generador)}
 SALIDA=${SALIDA:-resultados_empiricos}
 HOSTS=$(printf '%s\n' "$IP_GT" "$IP_BD" "$IP_VM4" "$IP_VM5" | awk '!v[$0]++')
 
+# Usuario y carpeta del proyecto de cada VM: por defecto USUARIO y RUTA (iguales en todas); si las VMs son cuentas de
+# personas distintas, ponga en vms.conf USUARIO_GT/RUTA_GT, USUARIO_BD/RUTA_BD, USUARIO_VM4/RUTA_VM4, USUARIO_VM5/RUTA_VM5.
+usuario_de() {
+    local u=$USUARIO
+    [ "$1" = "$IP_BD" ] && u=${USUARIO_BD:-$u}; [ "$1" = "$IP_GT" ] && u=${USUARIO_GT:-$u}
+    [ "$1" = "$IP_VM4" ] && u=${USUARIO_VM4:-$u}; [ "$1" = "$IP_VM5" ] && u=${USUARIO_VM5:-$u}
+    echo "$u"
+}
+ruta_de() {
+    local r=$RUTA
+    [ "$1" = "$IP_BD" ] && r=${RUTA_BD:-$r}; [ "$1" = "$IP_GT" ] && r=${RUTA_GT:-$r}
+    [ "$1" = "$IP_VM4" ] && r=${RUTA_VM4:-$r}; [ "$1" = "$IP_VM5" ] && r=${RUTA_VM5:-$r}
+    echo "$r"
+}
 en() {  # en <ip> <comando>: ejecuta en esa VM, dentro de la carpeta del proyecto
     local ip=$1; shift
     if [ "$MODO" = "local" ]; then bash -c "cd '$RUTA' && $*"
-    else ssh $SSH_OPTS "$USUARIO@$ip" "cd '$RUTA' && $*"; fi
+    else ssh $SSH_OPTS "$(usuario_de "$ip")@$ip" "cd '$(ruta_de "$ip")' && $*"; fi
 }
 lanzar() {  # lanzar <ip> <nombre_log> <comando>: arranca en segundo plano, sobrevive al cierre de ssh
     en "$1" "mkdir -p logs && (setsid nohup $3 > logs/$2.log 2>&1 < /dev/null &); sleep 0.2; true"
@@ -71,7 +93,7 @@ cmd_verificar() {
     for ip in $HOSTS; do
         echo "-- $ip  ($(rol_de "$ip"))"
         if ! en "$ip" "hostname" >/dev/null 2>&1; then
-            echo "   ERROR: no hay ssh sin contraseña hacia $USUARIO@$ip (ver 'Preparar el ssh' en el README)"; mal=1; continue
+            echo "   ERROR: no hay ssh sin contraseña hacia $(usuario_de "$ip")@$ip, o no existe la carpeta $(ruta_de "$ip") (ver 'Preparar el ssh' en el README)"; mal=1; continue
         fi
         faltan=""
         necesarios=""   # solo los binarios que esa VM necesita según su rol
@@ -82,7 +104,7 @@ cmd_verificar() {
         for b in $(echo $necesarios | tr ' ' '\n' | sort -u); do
             en "$ip" "test -x bin/$b" 2>/dev/null || faltan="$faltan $b"
         done
-        [ -n "$faltan" ] && { echo "   AVISO: faltan binarios:$faltan (en esa VM: cd $RUTA && make bin/${faltan# } -- ver 'Preparar VM4 y VM5' en el README)"; }
+        [ -n "$faltan" ] && { echo "   AVISO: faltan binarios:$faltan (en esa VM: cd $(ruta_de "$ip") && make bin/${faltan# } -- ver 'Preparar VM4 y VM5' en el README)"; }
         en "$ip" "test -x scripts/muestreo_cpu.sh" 2>/dev/null || { echo "   ERROR: falta scripts/muestreo_cpu.sh (copie la carpeta scripts/)"; mal=1; }
         echo "   ok: $(en "$ip" 'hostname; nproc' | paste -sd' ') núcleos"
     done
@@ -122,13 +144,21 @@ esperar_registro() {  # esperar_registro <cuántos RMC (hilos) debe ver el GT>
 arrancar() {  # arrancar <base|escalable|elastica>
     local arq=$1 hb=$HILOS_BD
     [ "$arq" = base ] && hb=1
+    ASIENTOS_USO=$ASIENTOS; [ "$arq" = escalamiento ] && ASIENTOS_USO=$ASIENTOS_ESC
     echo ">> Arrancando topología '$arq' (persistencia con $hb hilos)"
     parar_todo; sleep 1
-    lanzar "$IP_BD" persistencia "bin/persistencia --reset --silencioso --hilos $hb --asientos $ASIENTOS"
+    lanzar "$IP_BD" persistencia "bin/persistencia --reset --silencioso --hilos $hb --asientos $ASIENTOS_USO"
     sleep 2.5
     lanzar "$IP_GT" cancelaciones "bin/cancelaciones --silencioso --persistencia tcp://$IP_BD:5559"
-    lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --stats-csv logs/gt1.csv"
+    [ "$arq" != escalamiento ] && lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --stats-csv logs/gt1.csv"
     case $arq in
+        escalamiento)   # niveles en orden de activación: base (VM3) -> vm4 -> vm5; el GT decide según la CPU de cada VM
+            en "$IP_GT" "rm -f logs/escala.csv"
+            lanzar "$IP_GT" gt1 "bin/gestor --silencioso --nombre GT1 --cancel tcp://localhost:5557 --escalar base,vm4,vm5 --umbral-out $UMBRAL_OUT --umbral-in $UMBRAL_IN --sostenido-out 3 --sostenido-in 10 --enfriar 8 --cubeta $CUBETA $( [ "$FUGA" != 0 ] && echo "--fuga $FUGA" ) --linea-tiempo logs/escala.csv --stats-csv logs/gt1.csv"
+            lanzar "$IP_GT" rmc_base "bin/rmc --silencioso --nombre base --hilos $HILOS_ESC --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
+            lanzar "$IP_VM4" rmc_vm4 "bin/rmc --silencioso --nombre vm4 --hilos $HILOS_ESC --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
+            lanzar "$IP_VM5" rmc_vm5 "bin/rmc --silencioso --nombre vm5 --hilos $HILOS_ESC --gt tcp://$IP_GT:5556 --persistencia tcp://$IP_BD:5559"
+            ESPERADOS=$((3 * HILOS_ESC)) ;;
         base)
             lanzar "$IP_GT" rmc_base "bin/rmc --silencioso --nombre base --hilos 1 --gt tcp://localhost:5556 --persistencia tcp://$IP_BD:5559"
             ESPERADOS=1 ;;
@@ -247,8 +277,56 @@ cmd_procedimientos() {  # cada procedimiento por separado, para saber qué compo
     echo; echo "Listo. Archivos en $SALIDA/ . Guarde también la salida de esta ejecución."
 }
 
+cmd_escalamiento() {
+    SALIDA=${SALIDA_ESC:-resultados_escalamiento}; mkdir -p "$SALIDA"; rm -f "$SALIDA"/*.csv "$SALIDA"/*.log "$SALIDA"/*.txt "$SALIDA"/*.png "$SALIDA"/*.md
+    test -x bin/generador || { echo "Falta bin/generador: haga 'make' en esta máquina"; exit 1; }
+    if [ "$IP_VM4" = "$IP_GT" ] || [ "$IP_VM5" = "$IP_GT" ] || [ "$IP_VM4" = "$IP_VM5" ]; then
+        echo "AVISO: IP_VM4/IP_VM5 comparten VM con otro nivel. Funciona, pero el escalado no demuestra VMs distintas."
+    fi
+    local total=0 n
+    for n in $PASOS; do total=$((total + PASO_S + 2)); done
+    echo "Rampa de clientes: $PASOS  (${PASO_S}s por paso, ~$((total / 60)) min)  umbral-out=${UMBRAL_OUT}% umbral-in=${UMBRAL_IN}% cubeta=$CUBETA fuga=${FUGA}/s"
+    arrancar escalamiento || { echo "No se pudo completar el arranque (use '$0 parar' antes de reintentar)"; exit 1; }
+    en "$IP_BD" "pkill -USR2 -f '[b]in/persistencia'"; sleep 4
+    # CPU por segundo de las VMs que no informan al GT (la BD y esta máquina)
+    scripts/cpu_serie.sh $((total + 20)) > "$SALIDA/cpu_VM1_generador.csv" 2>&1 &
+    SAMPLERS=($!)
+    en "$IP_BD" "scripts/cpu_serie.sh $((total + 20))" > "$SALIDA/cpu_BD.csv" 2>&1 &
+    SAMPLERS+=($!)
+    echo "clientes,fila_gt,paso" > "$SALIDA/pasos.csv"
+    local i=0 fila nc
+    printf '\n%-8s %-9s %-22s %-22s %-22s %s\n' "Clientes" "ops/s" "CONSULTA prom/p95 ms" "RESERVA prom/p95 ms" "MODIFIC prom/p95 ms" "rechazos/errores"
+    for n in $PASOS; do
+        i=$((i + 1))
+        fila=$(en "$IP_GT" "wc -l < logs/escala.csv" 2>/dev/null | tail -1)
+        echo "$n,${fila:-0},$i" >> "$SALIDA/pasos.csv"
+        # shellcheck disable=SC2046
+        timeout $((PASO_S + 30)) bin/generador --clientes "$n" --solo-consulta $((n / 4)) --pct-consulta 30 --pct-reserva 50 --pct-modificar 20 \
+            --rpm 0 --duracion "$PASO_S" --calentamiento 0 --gt "tcp://$IP_GT:5555" --notif "tcp://$IP_GT:5558" \
+            --arquitectura escalamiento --repeticion "$i" --muestras "$SALIDA/paso${i}_muestras.csv" \
+            > "$SALIDA/paso${i}_c${n}.gen.log" 2>&1
+        awk -v n="$n" -v dur="$PASO_S" '
+            /CONSULTA:/{split($0,a," "); for(k in a){if(a[k]~/^n=/)cn=substr(a[k],3); if(a[k]~/^prom=/)cp=substr(a[k],6); if(a[k]~/^p95=/)c95=substr(a[k],5)}}
+            /RESERVA:/{for(k=1;k<=NF;k++){if($k~/^n=/)rn=substr($k,3); if($k~/^prom=/)rp=substr($k,6); if($k~/^p95=/)r95=substr($k,5)}}
+            /MODIFIC/{for(k=1;k<=NF;k++){if($k~/^n=/)mn=substr($k,3); if($k~/^prom=/)mp=substr($k,6); if($k~/^p95=/)m95=substr($k,5)}}
+            /errores=/{for(k=1;k<=NF;k++){if($k~/^errores=/)er=substr($k,9); if($k~/^sobrecarga=/)sb=substr($k,11)}}
+            END{printf "%-8d %-9.0f %-22s %-22s %-22s %s/%s\n", n, (cn+rn+mn)/dur, cp"/"c95, rp"/"r95, mp"/"m95, sb+0, er+0}' "$SALIDA/paso${i}_c${n}.gen.log"
+    done
+    wait "${SAMPLERS[@]}" 2>/dev/null
+    en "$IP_GT" "cat logs/escala.csv" > "$SALIDA/escala_gt.csv" 2>/dev/null
+    en "$IP_GT" "grep -E 'ESCALA|CUBETA|RMC registrado|sin señales' logs/gt1.log" > "$SALIDA/eventos_gt.txt" 2>/dev/null
+    echo; echo "== Eventos del GT (escalado y cubeta) =="; grep -E "ESCALA|CUBETA" "$SALIDA/eventos_gt.txt" | sed 's/^/   /'
+    if python3 -c "import pandas, matplotlib" 2>/dev/null; then
+        python3 analisis/escalamiento.py "$SALIDA" --umbral-out "$UMBRAL_OUT" --umbral-in "$UMBRAL_IN"
+    else
+        echo "(instale pandas y matplotlib para el gráfico:  pip3 install pandas matplotlib ; luego: python3 analisis/escalamiento.py $SALIDA)"
+    fi
+    echo; echo "Listo. Archivos en $SALIDA/ . Guarde también la salida de esta ejecución."
+}
+
 case "${1:-}" in
     mapa) cmd_mapa ;;
+    escalamiento) cmd_escalamiento ;;
     procedimientos) cmd_procedimientos "${2:-}" ;;
     verificar) cmd_verificar ;;
     correr) cmd_correr "${2:-}" ;;

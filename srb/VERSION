@@ -1,1 +1,1 @@
-SRB v3.1 (2026-11-18): + procedimientos (CPU por procedimiento), muestreo de la VM generadora, etiquetas de VM en vms.conf
+SRB v3.2 (2026-11-18): + escalado por CPU (scale-out/scale-in) y leaky bucket; prueba escalamiento; procedimientos

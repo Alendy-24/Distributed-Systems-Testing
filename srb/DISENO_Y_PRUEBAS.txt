@@ -15,8 +15,8 @@ LEA PRIMERO (honestidad sobre lo verificado)
   compiten por la misma CPU). Las tablas y gráficos del informe salen de correr scripts/tabla1.sh en sus VMs.
 * Interpretación de "distribuyendo equitativamente entre 2 VMs libres": (a) el trabajo del RMC se reparte por
   igual entre VM4 y VM5 (el GT lo mide e imprime: 51.4% / 48.6% en las pruebas), y (b) el generador de carga
-  puede dividirse entre 2 VMs (--vm-indice 0/1 --vm-total 2). NO implementé la idea de activar las 2 VMs por
-  umbrales de carga (arranque dinámico): las 2 réplicas están siempre activas.
+  puede dividirse entre 2 VMs (--vm-indice 0/1 --vm-total 2). La activación por umbrales de carga (scale-out /
+  scale-in según la CPU de cada VM) y el leaky bucket se agregaron después: ver la sección 12.
 
 
 1. QUÉ CAMBIÓ RESPECTO A LA PRIMERA ENTREGA
@@ -240,7 +240,7 @@ Qué esperar y cómo analizarlo (análisis para el informe, SIN inventar número
   - El "broker" de ROUTER/DEALER es el propio GT (no hay un proceso broker aparte): no es un punto de fallo extra.
   - La Persistencia es multihilo (ROUTER/DEALER interno + hilos REP + pool de conexiones). No hay réplica de
     BD: si el informe la menciona, quítenla o dígala como trabajo futuro.
-  - No hay activación por umbrales de carga: las 2 VMs de RMC están siempre activas.
+  - Activación por umbrales: opcional (--escalar); ver la sección 12. Sin esa opción las VMs de RMC están siempre activas.
   - Diagramas a rehacer: despliegue (5 VMs, sección 2), componentes (GT con 2 ROUTER, RMC con DEALER, hilos de
     Persistencia, GT de relevo), clases (Mensaje con idMensaje 64 bits; EnlaceGT; clases de servicio; Metricas;
     tabla transaccion) y secuencia (reserva normal; reserva con caída del RMC y reasignación; reserva con
@@ -278,19 +278,47 @@ CPU por transacción, arquitectura escalable, 4 clientes sin pausa, 20 s:
 - El límite se desplaza a PostgreSQL: cuando VM3 se acerque al 100% de CPU o de disco (iowait), más RMC ya no mejora y la
   única salida es la BD (réplicas, particionado, ajustes). Es la limitación declarada en la sección 5.
 
-Patrones adicionales evaluados (NO implementados):
+Patrones adicionales evaluados:
 - Leaky bucket (admisión a ritmo constante): no ayuda en la Tabla 1, porque con <= 8 clientes que esperan su respuesta la carga
-  ya está acotada y el cubo solo añadiría espera. Tiene sentido con muchos clientes o ráfagas. Lo que hoy falta en el GT es una
-  cola ACOTADA con rechazo inmediato ("sistema ocupado"): hoy la cola solo caduca a los 15 s. Eso (load shedding / contrapresión)
-  es más adecuado que un ritmo fijo porque la capacidad real varía con la BD.
+  ya está acotada y el cubo solo añadiría espera. Tiene sentido con muchos clientes o ráfagas. SE IMPLEMENTÓ DESPUÉS (sección 12)
+  como cola acotada con rechazo inmediato (SOBRECARGA) y salida opcionalmente a ritmo constante, y solo entra cuando ya no hay más
+  VMs que activar. (Pendiente en el original: la cola solo caducaba a los 15 s.)
 - Circuit breaker: más relevante. Si Persistencia/PostgreSQL cae, cada trabajador RMC se bloquea 3 s por solicitud, la cola del
   GT crece y los clientes reintentan (tormenta de reintentos; sin duplicados gracias a la idempotencia, pero con latencias
   enormes). Un breaker en el RMC (cerrado -> abierto tras N timeouts seguidos, responde ERROR al instante durante T segundos,
   semiabierto con una sonda) falla rápido y recupera sin esperar. No elimina el punto único de falla de la BD.
   El enunciado exige tolerar fallas del GT y del RMC, no de la BD, así que son mejoras opcionales.
+  (El circuit breaker NO se implementó.)
 
-RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarrollo)
-------------------------------------------------------------------------------
+
+12. ESCALADO AUTOMÁTICO POR CPU (SCALE-OUT / SCALE-IN) Y LEAKY BUCKET  (v3.2)
+-----------------------------------------------------------------------------
+Qué es: el GT decide cuántas VMs de RMC reciben trabajo según la CPU de cada VM. Cada RMC informa la CPU de su nodo (/proc/stat,
+% de todos los núcleos) en cada READY/heartbeat (tercera trama). El GT (gestor --escalar base,vm4,vm5) mantiene "niveles activos":
+empieza con 1 (VM3), y activa el siguiente cuando la CPU del último nivel activo se mantiene >= 50 % durante 3 s; libera el último
+cuando queda < 20 % durante 10 s y el anterior tiene holgura (< 40 %); mínimo 8 s entre cambios (anti-oscilación). Con varios
+niveles activos el reparto es parejo (LRU). Los RMC de los niveles inactivos están registrados y en espera: "activar" es empezar a
+repartirles solicitudes (escalado lógico: no se arrancan ni apagan máquinas ni procesos).
+Leaky bucket: cuando todos los niveles disponibles están activos y el último sigue >= 50 %, se activa la cubeta: la cola de espera
+del GT queda acotada a --cubeta N y, con --fuga R, su salida se limita a R solicitudes/s. Una solicitud que llega con la cubeta
+llena recibe SOBRECARGA de inmediato (Estado nuevo en el mensaje) sin ocupar un RMC; el generador la cuenta aparte (no entra en los
+tiempos ni en los errores) y espera --backoff-ms antes del siguiente pedido. Se libera cuando la CPU baja de 40 %.
+Patrones: escalado horizontal con umbrales e histéresis (threshold-based autoscaling), balanceo LRU, leaky bucket / load shedding
+(contrapresión) para proteger la latencia, y heartbeats con carga (CPU) incorporada al detector de fallas.
+Cómo se prueba: scripts/pruebas_escalado.sh (24 comprobaciones, CPU simulada con un archivo por VM: determinista) y, con CPU real
+en las VMs, scripts/prueba_empirica.sh escalamiento (rampa de clientes 4->160->4; produce escala_gt.csv, un gráfico de 4 paneles
+y un resumen por paso con analisis/escalamiento.py).
+Límites y advertencias:
+- Con los costos medidos (sección 11) el GT + RMC de VM3 cuestan ~0.3 ms de CPU por transacción y la BD ~0.9 ms: la BD tiende a
+  saturarse ANTES que VM3. Entonces VM3 puede no llegar al 50 % y el escalado no se dispara, o se dispara y el rendimiento total
+  no sube (el límite es la BD). Para la demostración se puede bajar el umbral (UMBRAL_OUT=30) o subir la carga (PASOS); el gráfico
+  muestra la CPU de cada VM, de la BD y de VM1 para saber qué ocurrió y si VM1 (el generador) se saturó.
+- Cada GT (principal y relevo) lleva su propio estado de escalado; la CPU medida es la del nodo completo (incluye otros procesos).
+- Si el primer nivel se queda sin RMC, se activa el primero que tenga (tolerancia a fallas); si cae una VM activa se sigue con las demás.
+- Las cancelaciones no pasan por la cubeta (se aceptan de inmediato como antes).
+
+RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarrollo, v3.2: 52 + 24 de escalado)
+------------------------------------------------------------------------------------------------
 == 1. Pruebas unitarias del mensaje ==
   [PASS] 18 pruebas, 0 fallos
 == 2. Prueba funcional (reservas, modificaciones, cancelaciones, idempotencia, mensajes inválidos) ==
@@ -300,36 +328,37 @@ RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarro
   [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
 == 3. Concurrencia: 8 clientes compitiendo por 120 asientos (sin pausa, 15s) ==
-    [02:56:58.821] [CARGA] RESERVA:  n=9059 prom=4.53 ms std=2.40 p95=9.22 TPM=36236.0 rechazos=6888 timeouts=0
-    [02:56:58.821] [CARGA] MODIFIC.: n=6263 prom=4.98 ms std=2.60 p95=9.76 TPM=25052.0 rechazos=2898 timeouts=0
-    [02:56:58.821] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=2171 reservas_sin_respuesta=0
-    [02:56:58.821] [CARGA] cancelaciones enviadas=2120 notificaciones recibidas=2120
+    [20:11:11.942] [CARGA] RESERVA:  n=10405 prom=3.88 ms std=1.80 p95=7.22 TPM=41620.0 rechazos=7865 timeouts=0
+    [20:11:11.942] [CARGA] MODIFIC.: n=7337 prom=4.27 ms std=1.90 p95=7.70 TPM=29348.0 rechazos=3421 timeouts=0
+    [20:11:11.942] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=2540 reservas_sin_respuesta=0 sobrecarga=0
+    [20:11:11.942] [CARGA] cancelaciones enviadas=2480 notificaciones recibidas=2480
   [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
   [PASS] libres + ocupados = 120 (no se perdieron ni crearon asientos) [120]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
   [PASS] ninguna respuesta de error [errores=0]
   [PASS] ninguna solicitud sin respuesta [0]
-  [PASS] reservas confirmadas a los clientes = filas en la tabla reserva [2171 = 2171]
+  [PASS] reservas confirmadas a los clientes = filas en la tabla reserva [2540 = 2540]
 == 4. Reparto equitativo entre las 2 VMs de RMC (carga normal, 15s) ==
-    [02:57:18.735] [CARGA] CONSULTA: n=729 prom=4.17 ms std=1.87 p95=7.17 TPM=3364.6 timeouts=0
-    [02:57:18.735] [CARGA] RESERVA:  n=207 prom=7.01 ms std=2.09 p95=10.01 TPM=955.4 rechazos=0 timeouts=0
-    [02:57:18.735] [CARGA] MODIFIC.: n=104 prom=6.66 ms std=1.76 p95=9.92 TPM=480.0 rechazos=0 timeouts=0
-    [02:57:18.735] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=236 reservas_sin_respuesta=0
-    [02:57:18.735] [CARGA] fila agregada a logs/pruebas/reparto.csv
-    [02:57:18.737] [GT-STATS] reparto entre VMs: vm4=598 (50.5%)  vm5=586 (49.5%)  
-  [PASS] reparto equitativo: vm4=598 vm5=586 (diferencia 1% <= 5%)
+    [20:11:33.827] [CARGA] CONSULTA: n=729 prom=2.83 ms std=1.03 p95=4.88 TPM=3364.6 timeouts=0
+    [20:11:33.827] [CARGA] RESERVA:  n=207 prom=4.98 ms std=1.53 p95=7.51 TPM=955.4 rechazos=0 timeouts=0
+    [20:11:33.827] [CARGA] MODIFIC.: n=104 prom=4.89 ms std=1.67 p95=8.20 TPM=480.0 rechazos=0 timeouts=0
+    [20:11:33.827] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=236 reservas_sin_respuesta=0 sobrecarga=0
+    [20:11:33.827] [CARGA] fila agregada a logs/pruebas/reparto.csv
+    [20:11:33.829] [GT-STATS] reparto entre VMs: vm4=597 (50.4%)  vm5=587 (49.6%)  
+  [PASS] reparto equitativo: vm4=597 vm5=587 (diferencia 0% <= 5%)
   [PASS] sin errores [0]
   [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
   [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
 == 5. Falla de una VM de RMC en plena carga, con asientos escasos (se apaga vm4 con kill -9 a los 6 s) ==
-    [02:57:39.271] [CARGA] CONSULTA: n=24121 prom=2.85 ms std=13.25 p95=4.34 TPM=96484.0 timeouts=0
-    [02:57:39.271] [CARGA] RESERVA:  n=9558 prom=2.97 ms std=1.39 p95=4.68 TPM=38232.0 rechazos=9439 timeouts=0
-    [02:57:39.272] [CARGA] MODIFIC.: n=5820 prom=3.49 ms std=26.89 p95=4.98 TPM=23280.0 rechazos=4721 timeouts=0
-    [02:57:39.272] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=119 reservas_sin_respuesta=0
-    [02:57:32.110] [GT1] RMC vm4/h1#4386 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
-    [02:57:32.110] [GT1] RMC vm4/h0#4386 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
-    [02:57:39.274] [GT-STATS] inválidas=0 reasignadas=2 expiradas=0
+scripts/pruebas_automaticas.sh: line 120:  9034 Killed                  "$@" > "$LOG/$nombre.log" 2>&1
+    [20:11:54.365] [CARGA] CONSULTA: n=29414 prom=2.33 ms std=0.83 p95=3.57 TPM=117656.0 timeouts=0
+    [20:11:54.367] [CARGA] RESERVA:  n=10852 prom=2.87 ms std=27.29 p95=3.74 TPM=43408.0 rechazos=10733 timeouts=0
+    [20:11:54.368] [CARGA] MODIFIC.: n=6595 prom=2.69 ms std=0.98 p95=4.16 TPM=26380.0 rechazos=5337 timeouts=0
+    [20:11:54.368] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=119 reservas_sin_respuesta=0 sobrecarga=0
+    [20:11:47.167] [GT1] RMC vm4/h1#9034 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
+    [20:11:47.167] [GT1] RMC vm4/h0#9034 sin señales: se da por caído; su solicitud en curso se reasigna a otro RMC
+    [20:11:54.370] [GT-STATS] inválidas=0 reasignadas=2 expiradas=0 sobrecarga=0
   [PASS] el GT detectó la caída de las 2 réplicas de vm4 por falta de heartbeat [2]
   [PASS] la falla fue transparente: ningún error para los clientes [errores=0]
   [PASS] ninguna reserva quedó sin respuesta [0]
@@ -338,20 +367,21 @@ RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarro
   [PASS] libres + ocupados = 120 (no se perdieron ni crearon asientos) [120]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
 == 6. Falla del GT principal en plena carga (kill -9 a los 6 s; los clientes pasan al GT de relevo) ==
-    [02:58:07.845] [CARGA] CONSULTA: n=30881 prom=3.82 ms std=22.82 p95=5.67 TPM=80559.1 timeouts=0
-    [02:58:07.846] [CARGA] RESERVA:  n=8057 prom=5.22 ms std=38.62 p95=8.02 TPM=21018.3 rechazos=4772 timeouts=0
-    [02:58:07.846] [CARGA] MODIFIC.: n=3988 prom=5.26 ms std=31.80 p95=8.44 TPM=10403.5 rechazos=1172 timeouts=0
-    [02:58:07.846] [CARGA] errores=0 reintentos=8 cambios_de_GT=8 reservas_confirmadas=3285 reservas_sin_respuesta=0
+scripts/pruebas_automaticas.sh: line 138:  9134 Killed                  "$@" > "$LOG/$nombre.log" 2>&1
+    [20:12:22.933] [CARGA] CONSULTA: n=39252 prom=3.01 ms std=20.24 p95=4.30 TPM=102396.5 timeouts=0
+    [20:12:22.933] [CARGA] RESERVA:  n=10281 prom=4.04 ms std=34.25 p95=6.03 TPM=26820.0 rechazos=6802 timeouts=0
+    [20:12:22.934] [CARGA] MODIFIC.: n=5130 prom=4.08 ms std=28.00 p95=6.24 TPM=13382.6 rechazos=1832 timeouts=0
+    [20:12:22.934] [CARGA] errores=0 reintentos=8 cambios_de_GT=8 reservas_confirmadas=3479 reservas_sin_respuesta=0 sobrecarga=0
   [PASS] los clientes pasaron al GT de relevo [cambios_de_GT=8]
   [PASS] ningún error para los clientes [errores=0]
   [PASS] ninguna reserva quedó sin respuesta [0]
-  [PASS] los reintentos no duplicaron ni perdieron reservas: confirmadas = filas [3285 = 3285]
+  [PASS] los reintentos no duplicaron ni perdieron reservas: confirmadas = filas [3479 = 3479]
   [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
   [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
 == 7. Generador repartido en 2 VMs (mismo comando, --vm-indice 0 y 1) ==
-    [02:58:12.549] [CARGA] VM 0/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
-    [02:58:12.549] [CARGA] VM 1/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
+    [20:12:27.628] [CARGA] VM 0/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
+    [20:12:27.627] [CARGA] VM 1/2: 4 de 8 clientes (solo consulta: 2) rpm=300 duracion=15s calentamiento=2s
   [PASS] 8 clientes repartidos 4 + 4 entre las 2 VMs [4 + 4]
   [PASS] los 4 clientes que reservan (2 por VM) tienen ids distintos entre VMs [4]
   [PASS] cada VM generadora escribe su propio CSV de muestras (vm_indice 0 1 )
@@ -368,19 +398,60 @@ RESULTADO DE LA BATERÍA (scripts/pruebas_automaticas.sh 15, máquina de desarro
   [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
 == 9. Supervisor: un proceso nuevo sustituye al RMC que cae (kill -9 a los 5 s) ==
-    [02:58:55.517] [CARGA] RESERVA:  n=5893 prom=4.24 ms std=1.68 p95=7.07 TPM=23572.0 rechazos=2794 timeouts=0
-    [02:58:55.518] [CARGA] MODIFIC.: n=2935 prom=4.46 ms std=1.68 p95=7.41 TPM=11740.0 rechazos=655 timeouts=0
-    [02:58:55.518] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=3099 reservas_sin_respuesta=0
-    [SUPERVISOR 02:58:45] bin/rmc terminó con código 137; arranco un proceso nuevo (reinicio #1)
+    [20:13:10.512] [CARGA] RESERVA:  n=6840 prom=3.81 ms std=1.68 p95=6.75 TPM=27360.0 rechazos=3630 timeouts=0
+    [20:13:10.513] [CARGA] MODIFIC.: n=3348 prom=4.04 ms std=1.56 p95=6.87 TPM=13392.0 rechazos=818 timeouts=0
+    [20:13:10.513] [CARGA] errores=0 reintentos=0 cambios_de_GT=0 reservas_confirmadas=3210 reservas_sin_respuesta=0 sobrecarga=0
+    [SUPERVISOR 20:13:00] bin/rmc terminó con código 137; arranco un proceso nuevo (reinicio #1)
   [PASS] el supervisor arrancó un proceso nuevo tras la caída
   [PASS] el GT registró de nuevo las réplicas de vm4 (2 al inicio + 2 del proceso nuevo) [4]
   [PASS] falla transparente: errores=0, sin respuesta=0
-  [PASS] confirmadas = filas de la BD [3099 = 3099]
+  [PASS] confirmadas = filas de la BD [3210 = 3210]
   [PASS] ninguna ocurrencia con asientos negativos (sin sobreventa)
   [PASS] libres + ocupados = 7000 (no se perdieron ni crearon asientos) [7000]
   [PASS] asientos ocupados = suma de las reservas activas en todas las ocurrencias [incoherentes=0]
+== 10-11. Escalado por CPU (scale-out/scale-in) y leaky bucket (scripts/pruebas_escalado.sh) ==
+== 10. Scale-out / scale-in por CPU: base -> vm4 -> vm5 y de vuelta (CPU simulada) ==
+    t=7s   base al 60 %  (la primera VM supera el 50 %)
+    t=15s  vm4 al 60 %   (la segunda también)
+    t=23s  la carga baja: base 30 %, vm4 5 %, vm5 5 %
+    [20:13:23.226] [GT-STATS] niveles activos=1/3
+    [20:13:24.231] [GT1] ESCALA-OUT: CPU de 'base' = 60% >= 50% -> se activa 'vm4' (2/3 niveles)
+    [20:13:32.235] [GT1] ESCALA-OUT: CPU de 'vm4' = 60% >= 50% -> se activa 'vm5' (3/3 niveles)
+    [20:13:33.237] [GT-STATS] niveles activos=3/3
+    [20:13:39.239] [GT1] ESCALA-IN: CPU de 'vm5' = 5% < 20% -> se libera (2/3 niveles)
+    [20:13:43.238] [GT-STATS] niveles activos=2/3
+    [20:13:43.240] [GT1] ESCALA-IN: CPU de 'vm4' = 5% < 20% -> se libera (1/3 niveles)
+    [20:13:53.238] [GT-STATS] niveles activos=1/3
+  [PASS] con base >= 50 % se activa vm4 (scale-out 1)
+  [PASS] con vm4 >= 50 % se activa vm5 (scale-out 2)
+  [PASS] exactamente 2 scale-out, sin oscilaciones [2]
+  [PASS] al bajar la carga se liberan vm5 y luego vm4 (scale-in)
+  [PASS] exactamente 2 scale-in [2]
+  [PASS] con 1 nivel activo todo el trabajo va a base [base=44852 vm4+vm5=0 en 25 s]
+  [PASS] con 2 niveles se reparte entre base y vm4, vm5 sigue sin trabajo [base=13126 vm4=13002 vm5=0]
+  [PASS] con 3 niveles trabajan las tres VMs [base=6185 vm4=6222 vm5=6472]
+  [PASS] con 3 niveles el reparto es parejo (diferencia máxima <= 15 %)
+  [PASS] al final solo queda 1 nivel activo [1]
+  [PASS] los cambios de nivel son transparentes: errores=0, sin respuesta=0
+  [PASS] reservas confirmadas = filas de la BD [4934 = 4934]
+== 11. Leaky bucket: se activa cuando todas las VMs están al límite y limita la entrada ==
+    t=8s   la única VM disponible pasa al 80 %  (no hay más niveles que activar)
+    t=18s  la carga cede: base 10 %
+    [20:14:14.538] [GT1] CUBETA ACTIVA: todos los niveles disponibles (1) están al límite (CPU 'base' = 80%); salida 100/s, capacidad 10
+    [20:14:22.528] [GT-STATS] niveles activos=1/1  CUBETA ACTIVA
+    [20:14:24.542] [GT1] CUBETA LIBERADA: CPU de 'base' = 10%
+  [PASS] con el último nivel al límite entra el leaky bucket
+  [PASS] al ceder la carga se libera la cubeta
+    sin cubeta: ~1601 respondidas/s (rechazadas 0 en 11 s)   con cubeta: ~100 respondidas/s (rechazadas 3556 en 9 s, cola máx 10)
+  [PASS] antes de activarse la cubeta no se rechaza nada [0]
+  [PASS] con la cubeta activa la salida queda en ~100 solicitudes/s (fuga) [100/s]
+  [PASS] sin cubeta el sistema procesa mucho más que con ella (el tope es deliberado) [1601 vs 100]
+  [PASS] con la cubeta activa el exceso se rechaza de inmediato (SOBRECARGA) [3556]
+  [PASS] la cola nunca supera la capacidad de la cubeta (10) [máx 10]
+  [PASS] los clientes recibieron los rechazos por SOBRECARGA [3956]
+  [PASS] tras liberarse la cubeta el sistema vuelve a todo su ritmo sin rechazos [2855/s, rechazos 0]
+  [PASS] rechazar por sobrecarga no genera errores ni solicitudes sin respuesta (errores=0, sin respuesta=0)
+  [PASS] lo rechazado no dejó rastro en la BD: confirmadas = filas [3764 = 3764]
+  [PASS] invariantes de la BD intactas (sin asientos negativos, ocupados = reservas activas)
 
-RESUMEN: 52 pruebas correctas, 0 fallidas   (logs en logs/pruebas/)
-
-(Corrida del 17-nov-2026, 1 máquina de 2 CPU. Las cifras de tiempo/TPM de arriba NO son las del informe.)
-
+RESUMEN: 76 pruebas correctas, 0 fallidas   (logs en logs/pruebas/)

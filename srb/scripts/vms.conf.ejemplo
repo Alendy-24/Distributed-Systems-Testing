@@ -17,3 +17,10 @@ IP_VM5=10.0.0.15                # VM5: RMC "vm5"
 # IP_GT=<IP de VM3>   IP_BD=<IP de VM2>   IP_VM4=<IP de VM3>   IP_VM5=<IP de VM3>
 # ET_GT="VM3-logica"  ET_BD="VM2-BD"      ET_VM4=""            ET_VM5=""            ET_GEN="VM1-carga"
 # CLIENTES_PROC=8   (clientes en 'prueba_empirica.sh procedimientos')
+
+# --- Si cada VM es la cuenta de una persona distinta (otro usuario y/u otra carpeta), añada solo lo que difiera:
+# USUARIO_GT=...   RUTA_GT=/home/.../srb      (VM3: GT + RMC base + cancelaciones)
+# USUARIO_BD=...   RUTA_BD=/home/.../srb      (VM2: PostgreSQL + persistencia)
+# USUARIO_VM4=...  RUTA_VM4=/home/.../srb     (VM4: RMC nivel 2)
+# USUARIO_VM5=...  RUTA_VM5=/home/.../srb     (VM5: RMC nivel 3)
+# Use IP numéricas (no nombres): los RMC de VM4/VM5 se conectan a VM3 y VM2 con esas direcciones.
