@@ -4,6 +4,13 @@ Proyecto de la asignatura **Introducción a Sistemas Distribuidos** — Pontific
 
 Este repositorio contiene el **SRB (Sistema de Reserva de Boletos)**: un sistema distribuido, escalable y tolerante a fallas, junto con los scripts y herramientas para desplegarlo en varias máquinas virtuales, someterlo a carga y medir su comportamiento.
 
+Integrantes:
+* Ale Corredor Morales
+* Salomé Avila
+* Juan Alvarez
+* Daniel Barreto
+* Arevalo Linares
+* 
 **Versión actual:** SRB v3.5 (2026-11-18) · **Lenguaje:** C++17 · **Comunicación:** ZeroMQ · **Base de datos:** PostgreSQL
 
 ---
